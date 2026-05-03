@@ -1,0 +1,40 @@
+[package]
+name = "netto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDate",
+    "NSDictionary",
+    "NSNotification",
+    "NSObject",
+    "NSProcessInfo",
+    "NSString",
+    "NSThread",
+    "NSTimer",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSButton",
+    "NSButtonCell",
+    "NSCell",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSWindow",
+    "NSView",
+    "objc2-core-foundation",
+] }

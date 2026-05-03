@@ -1,0 +1,43 @@
+# DevBuddy config file
+# See https://github.com/devbuddy/devbuddy/blob/master/docs/Config.md
+
+env:
+  ENV: development
+
+up:
+  - rust:
+      version: "1.95"
+
+commands:
+  run:
+    desc: Run the app
+    run: cargo run
+
+  build:
+    desc: Build the app
+    run: cargo build
+
+  test:
+    desc: Run all tests
+    run: cargo test
+
+  bundle:
+    desc: Build the .app bundle
+    run: |
+      cargo build --release
+      rm -rf target/Netto.app
+      mkdir -p target/Netto.app/Contents/MacOS
+      mkdir -p target/Netto.app/Contents/Resources
+      cp Info.plist target/Netto.app/Contents/
+      cp target/release/netto target/Netto.app/Contents/MacOS/
+      echo "Built target/Netto.app"
+
+  install:
+    desc: Build and install the app to /Applications
+    run: |
+      bud bundle
+      osascript -e 'tell application "Netto" to quit' 2>/dev/null || true
+      rm -rf /Applications/Netto.app
+      cp -R target/Netto.app /Applications/Netto.app
+      echo "Installed to /Applications/Netto.app"
+      open /Applications/Netto.app
