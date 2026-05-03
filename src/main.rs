@@ -1,6 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod ping;
+mod preferences;
+mod settings;
 
 use std::cell::RefCell;
 
@@ -16,7 +18,7 @@ use objc2_foundation::{ns_string, NSNotification, NSObject, NSObjectProtocol, NS
 
 use ping::{PingResult, PingTarget};
 
-const TARGETS: &[(&str, &str)] = &[
+const DEFAULT_TARGETS: &[(&str, &str)] = &[
     ("google.com", "google.com"),
     ("cloudflare.com", "1.1.1.1"),
     ("apple.com", "apple.com"),
@@ -48,6 +50,37 @@ define_class!(
             self.update_display(mtm);
             self.schedule_timer(mtm);
         }
+
+        #[unsafe(method(showPreferences:))]
+        unsafe fn show_preferences(&self, _sender: &AnyObject) {
+            unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.0,
+                    self as &AnyObject,
+                    sel!(openPreferencesDeferred:),
+                    None,
+                    false,
+                );
+            }
+        }
+
+        #[unsafe(method(openPreferencesDeferred:))]
+        unsafe fn open_preferences_deferred(&self, _timer: &NSTimer) {
+            let mtm = MainThreadMarker::from(self);
+            self.open_preferences(mtm);
+        }
+
+        #[unsafe(method(reloadTargets:))]
+        unsafe fn reload_targets(&self, _sender: &AnyObject) {
+            let mtm = MainThreadMarker::from(self);
+            if let Some(targets) = settings::load_targets() {
+                let mut results = self.ivars().results.borrow_mut();
+                *results = vec![PingResult::Pending; targets.len()];
+                *self.ivars().targets.borrow_mut() = targets;
+            }
+            self.refresh_pings();
+            self.update_display(mtm);
+        }
     }
 );
 
@@ -55,6 +88,7 @@ struct AppDelegateIvars {
     status_item: Retained<NSStatusItem>,
     targets: RefCell<Vec<PingTarget>>,
     results: RefCell<Vec<PingResult>>,
+    prefs_controller: RefCell<Option<Retained<NSObject>>>,
 }
 
 impl AppDelegate {
@@ -62,13 +96,17 @@ impl AppDelegate {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
 
-        let targets: Vec<PingTarget> = TARGETS
-            .iter()
-            .map(|(name, host)| PingTarget {
-                name: name.to_string(),
-                host: host.to_string(),
-            })
-            .collect();
+        let targets = settings::load_targets().unwrap_or_else(|| {
+            let defaults: Vec<PingTarget> = DEFAULT_TARGETS
+                .iter()
+                .map(|(name, host)| PingTarget {
+                    name: name.to_string(),
+                    host: host.to_string(),
+                })
+                .collect();
+            settings::save_targets(&defaults);
+            defaults
+        });
 
         let results = vec![PingResult::Pending; targets.len()];
 
@@ -76,6 +114,7 @@ impl AppDelegate {
             status_item,
             targets: RefCell::new(targets),
             results: RefCell::new(results),
+            prefs_controller: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -93,18 +132,20 @@ impl AppDelegate {
         let targets = ivars.targets.borrow();
         let results = ivars.results.borrow();
 
-        // Status bar title: show primary target ping
         if let Some(button) = ivars.status_item.button(mtm) {
-            let title = match &results[0] {
-                PingResult::Ok(ms) => format!("\u{1F310} {ms:.0}ms"),
-                PingResult::Timeout => "\u{1F310} ---".to_string(),
-                PingResult::Error(_) => "\u{1F310} err".to_string(),
-                PingResult::Pending => "\u{1F310} ...".to_string(),
+            let title = if targets.is_empty() {
+                "\u{1F310} --".to_string()
+            } else {
+                match &results[0] {
+                    PingResult::Ok(ms) => format!("\u{1F310} {ms:.0}ms"),
+                    PingResult::Timeout => "\u{1F310} ---".to_string(),
+                    PingResult::Error(_) => "\u{1F310} err".to_string(),
+                    PingResult::Pending => "\u{1F310} ...".to_string(),
+                }
             };
             button.setTitle(&NSString::from_str(&title));
         }
 
-        // Build menu
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
 
@@ -123,11 +164,47 @@ impl AppDelegate {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+        let settings_item =
+            create_menu_item(mtm, ns_string!("Settings\u{2026}"), Some(sel!(showPreferences:)));
+        unsafe { settings_item.setTarget(Some(self as &AnyObject)) };
+        settings_item.setEnabled(true);
+        menu.addItem(&settings_item);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
         let quit_item = create_menu_item(mtm, ns_string!("Quit"), Some(sel!(terminate:)));
         quit_item.setKeyEquivalent(ns_string!("q"));
         menu.addItem(&quit_item);
 
         ivars.status_item.setMenu(Some(&menu));
+    }
+
+    fn open_preferences(&self, mtm: MainThreadMarker) {
+        let ivars = self.ivars();
+
+        {
+            let controller_ref = ivars.prefs_controller.borrow();
+            if let Some(obj) = controller_ref.as_ref() {
+                let _: () = unsafe { msg_send![obj, showWindow] };
+                return;
+            }
+        }
+
+        let app_delegate_ptr = self as *const AppDelegate as usize;
+        let on_save = Box::new(move || {
+            let obj = app_delegate_ptr as *const AnyObject;
+            unsafe {
+                let _: () = msg_send![obj, reloadTargets: std::ptr::null::<AnyObject>()];
+            }
+        });
+
+        let controller = {
+            let targets = ivars.targets.borrow();
+            preferences::PrefsController::new(mtm, &targets, on_save)
+        };
+
+        controller.show();
+        *ivars.prefs_controller.borrow_mut() = Some(Retained::into_super(controller));
     }
 
     fn schedule_timer(&self, _mtm: MainThreadMarker) {

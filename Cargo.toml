@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false, features = [
@@ -17,6 +19,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
     "NSThread",
     "NSTimer",
+    "NSURL",
+    "NSUserDefaults",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
@@ -24,17 +28,27 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSButton",
     "NSButtonCell",
     "NSCell",
+    "NSColor",
     "NSControl",
     "NSEvent",
     "NSFont",
+    "NSGraphics",
+    "NSLayoutConstraint",
     "NSMenu",
     "NSMenuItem",
     "NSResponder",
     "NSRunningApplication",
+    "NSStackView",
+    "NSUserInterfaceLayout",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
-    "NSWindow",
+    "NSTextField",
+    "NSTextFieldCell",
+    "NSText",
     "NSView",
+    "NSWindow",
+    "NSWorkspace",
     "objc2-core-foundation",
 ] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService"] }
