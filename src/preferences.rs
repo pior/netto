@@ -4,10 +4,12 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::sel;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSButtonType, NSColor, NSFont, NSLayoutAttribute,
     NSLayoutRelation, NSStackView, NSStackViewDistribution, NSTextField, NSTextFieldBezelStyle,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowStyleMask, NSWorkspace,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_app_kit::{NSControlStateValueOff, NSControlStateValueOn};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -16,9 +18,8 @@ use objc2_foundation::{ns_string, NSInteger, NSNotification, NSObject, NSObjectP
 use crate::ping::PingTarget;
 use crate::settings;
 
-const IDX_NAME: usize = 0;
-const IDX_HOST: usize = 1;
-const ROW_SUBVIEW_COUNT: usize = 3;
+const IDX_HOST: usize = 0;
+const ROW_SUBVIEW_COUNT: usize = 2;
 const MAX_ENTRY_ROWS: usize = 15;
 const PREF_WINDOW_WIDTH: f64 = 480.0;
 const CONTENT_PADDING: f64 = 16.0;
@@ -32,6 +33,15 @@ define_class!(
     pub struct PrefsController;
 
     unsafe impl NSObjectProtocol for PrefsController {}
+
+    unsafe impl NSWindowDelegate for PrefsController {
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            let mtm = MainThreadMarker::from(self);
+            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Accessory);
+        }
+    }
 
     impl PrefsController {
         #[unsafe(method(controlTextDidChange:))]
@@ -119,11 +129,14 @@ impl PrefsController {
         });
         let controller: Retained<Self> = unsafe { msg_send![super(this), init] };
 
+        let delegate: &ProtocolObject<dyn NSWindowDelegate> = ProtocolObject::from_ref(&*controller);
+        window.setDelegate(Some(delegate));
+
         let add_row = create_add_button_row(mtm, &controller);
         rows_stack.addArrangedSubview(&add_row);
 
         for target in targets {
-            controller.do_add_entry_with(mtm, &target.name, &target.host);
+            controller.do_add_entry_with(mtm, &target.host);
         }
 
         let launch_checkbox = create_launch_at_login_checkbox(mtm, &controller);
@@ -225,19 +238,17 @@ impl PrefsController {
         window.deminiaturize(None);
         window.makeKeyAndOrderFront(None);
         window.orderFrontRegardless();
-
-        app.setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Accessory);
     }
 
     fn do_add_entry(&self, mtm: MainThreadMarker) {
         if self.entry_count() >= MAX_ENTRY_ROWS {
             return;
         }
-        self.do_add_entry_with(mtm, "", "");
+        self.do_add_entry_with(mtm, "");
         self.do_save();
     }
 
-    fn do_add_entry_with(&self, mtm: MainThreadMarker, name: &str, host: &str) {
+    fn do_add_entry_with(&self, mtm: MainThreadMarker, host: &str) {
         if self.entry_count() >= MAX_ENTRY_ROWS {
             return;
         }
@@ -250,14 +261,9 @@ impl PrefsController {
         row_stack.setSpacing(8.0);
         row_stack.setDistribution(NSStackViewDistribution::Fill);
 
-        let name_field = create_text_field(mtm, "Name", name);
         let host_field = create_text_field(mtm, "Host / IP", host);
-
-        name_field.setTranslatesAutoresizingMaskIntoConstraints(false);
         host_field.setTranslatesAutoresizingMaskIntoConstraints(false);
-
         unsafe {
-            let _: () = msg_send![&name_field, setDelegate: delegate];
             let _: () = msg_send![&host_field, setDelegate: delegate];
         }
 
@@ -274,23 +280,8 @@ impl PrefsController {
         delete_btn.setTranslatesAutoresizingMaskIntoConstraints(false);
         add_width_constraint(&delete_btn, 24.0);
 
-        row_stack.addArrangedSubview(&name_field);
         row_stack.addArrangedSubview(&host_field);
         row_stack.addArrangedSubview(&delete_btn);
-
-        // Make both fields equal width
-        unsafe {
-            let constraint = objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
-                &host_field,
-                NSLayoutAttribute::Width,
-                NSLayoutRelation::Equal,
-                Some(&name_field),
-                NSLayoutAttribute::Width,
-                1.0,
-                0.0
-            );
-            row_stack.addConstraint(&*constraint);
-        }
 
         let count = ivars.rows_stack.arrangedSubviews().count();
         if count > 0 {
@@ -376,22 +367,15 @@ impl PrefsController {
                 continue;
             }
 
-            let name_field: Retained<NSTextField> =
-                row_subviews.objectAtIndex(IDX_NAME).downcast().unwrap();
             let host_field: Retained<NSTextField> =
                 row_subviews.objectAtIndex(IDX_HOST).downcast().unwrap();
 
-            let name = name_field.stringValue().to_string();
             let host = host_field.stringValue().to_string();
-
             if host.is_empty() {
                 continue;
             }
 
-            targets.push(PingTarget {
-                name: if name.is_empty() { host.clone() } else { name },
-                host,
-            });
+            targets.push(PingTarget { host });
         }
 
         settings::save_targets(&targets);

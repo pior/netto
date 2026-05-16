@@ -4,31 +4,36 @@ mod netinfo;
 mod ping;
 mod preferences;
 mod settings;
+mod sparkline;
 
 use std::cell::{Cell, RefCell};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::sel;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::AnyThread;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBezierPath, NSButton,
+    NSColor, NSFont, NSFontAttributeName, NSFontWeightRegular, NSForegroundColorAttributeName,
+    NSImage, NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSStatusBar, NSStatusItem, NSTextAlignment,
+    NSTextField, NSToolTipTag, NSView, NSVariableStatusItemLength,
 };
+use objc2_foundation::{NSAttributedString, NSDictionary};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use std::ffi::c_void;
 use objc2_foundation::{
     ns_string, NSNotification, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes,
     NSString, NSTimer,
 };
 
 use netinfo::NetInfo;
-use ping::{PingResult, PingService, PingTarget};
+use ping::{HostSnapshot, PingResult, PingService, PingTarget};
 
-const DEFAULT_TARGETS: &[(&str, &str)] = &[
-    ("google.com", "google.com"),
-    ("cloudflare.com", "1.1.1.1"),
-    ("apple.com", "apple.com"),
-];
+const DEFAULT_TARGETS: &[&str] = &["google.com", "cloudflare.com", "apple.com"];
 
 const SLOW_INTERVAL: Duration = Duration::from_secs(10);
 const FAST_INTERVAL: Duration = Duration::from_secs(1);
@@ -55,10 +60,14 @@ define_class!(
         #[unsafe(method(menuWillOpen:))]
         fn menu_will_open(&self, _menu: &NSMenu) {
             let mtm = MainThreadMarker::from(self);
+            // Run tick *before* marking the menu as open so any pending
+            // structural change (e.g. public IP arrived async) gets folded
+            // into the menu we're about to show — once `menu_open` is true,
+            // rebuild_menu_structure is skipped.
+            self.tick(mtm);
             self.ivars().menu_open.set(true);
             self.ivars().ping_service.set_interval(FAST_INTERVAL);
             self.reschedule_timer(mtm, FAST_INTERVAL);
-            self.tick(mtm);
         }
 
         #[unsafe(method(menuDidClose:))]
@@ -96,6 +105,16 @@ define_class!(
             self.open_preferences(mtm);
         }
 
+        /// Action target for IP chips — copies the sender's plain title
+        /// (the IP address) into the general pasteboard.
+        #[unsafe(method(copyIp:))]
+        unsafe fn copy_ip(&self, sender: &NSButton) {
+            let title = sender.title();
+            let pasteboard = NSPasteboard::generalPasteboard();
+            pasteboard.clearContents();
+            unsafe { pasteboard.setString_forType(&title, NSPasteboardTypeString) };
+        }
+
         #[unsafe(method(reloadTargets:))]
         unsafe fn reload_targets(&self, _sender: &AnyObject) {
             let mtm = MainThreadMarker::from(self);
@@ -113,15 +132,19 @@ struct AppDelegateIvars {
     ping_service: PingService,
     net_info: RefCell<NetInfo>,
     menu: Retained<NSMenu>,
-    target_items: RefCell<Vec<Retained<NSMenuItem>>>,
-    local_item: Retained<NSMenuItem>,
-    router_item: Retained<NSMenuItem>,
-    dns_items: RefCell<Vec<Retained<NSMenuItem>>>,
+    internet_row: InfoRow,
+    router_row: InfoRow,
+    target_rows: RefCell<Vec<InfoRow>>,
+    dns_rows: RefCell<Vec<InfoRow>>,
+    vpn_row: InfoRow,
+    ip_rows: RefCell<Vec<NetInfoRow>>,
     settings_item: Retained<NSMenuItem>,
     quit_item: Retained<NSMenuItem>,
     menu_open: Cell<bool>,
     refresh_timer: RefCell<Option<Retained<NSTimer>>>,
     prefs_controller: RefCell<Option<Retained<NSObject>>>,
+    public_v4: Arc<Mutex<Option<String>>>,
+    public_v6: Arc<Mutex<Option<String>>>,
 }
 
 impl AppDelegate {
@@ -132,9 +155,8 @@ impl AppDelegate {
         let targets = settings::load_targets().unwrap_or_else(|| {
             let defaults: Vec<PingTarget> = DEFAULT_TARGETS
                 .iter()
-                .map(|(name, host)| PingTarget {
-                    name: name.to_string(),
-                    host: host.to_string(),
+                .map(|host| PingTarget {
+                    host: (*host).to_string(),
                 })
                 .collect();
             settings::save_targets(&defaults);
@@ -144,8 +166,9 @@ impl AppDelegate {
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
 
-        let local_item = info_item(mtm);
-        let router_item = info_item(mtm);
+        let internet_row = InfoRow::new(mtm);
+        let router_row = InfoRow::new(mtm);
+        let vpn_row = InfoRow::new(mtm);
 
         let settings_item =
             create_menu_item(mtm, ns_string!("Settings\u{2026}"), Some(sel!(showPreferences:)));
@@ -160,15 +183,19 @@ impl AppDelegate {
             ping_service: PingService::new(SLOW_INTERVAL),
             net_info: RefCell::new(NetInfo::default()),
             menu,
-            target_items: RefCell::new(Vec::new()),
-            local_item,
-            router_item,
-            dns_items: RefCell::new(Vec::new()),
+            internet_row,
+            router_row,
+            target_rows: RefCell::new(Vec::new()),
+            dns_rows: RefCell::new(Vec::new()),
+            vpn_row,
+            ip_rows: RefCell::new(Vec::new()),
             settings_item,
             quit_item,
             menu_open: Cell::new(false),
             refresh_timer: RefCell::new(None),
             prefs_controller: RefCell::new(None),
+            public_v4: Arc::new(Mutex::new(None)),
+            public_v6: Arc::new(Mutex::new(None)),
         });
         let delegate: Retained<Self> = unsafe { msg_send![super(this), init] };
         unsafe { delegate.ivars().settings_item.setTarget(Some(&*delegate as &AnyObject)) };
@@ -190,9 +217,25 @@ impl AppDelegate {
         let new_info = netinfo::collect();
 
         let prev_info = ivars.net_info.borrow().clone();
-        let structure_changed = prev_info.router_ip.is_some() != new_info.router_ip.is_some()
-            || prev_info.dns_ips.len() != new_info.dns_ips.len()
-            || ivars.target_items.borrow().len() != ivars.targets.borrow().len();
+
+        // Re-fetch the public IP whenever the local network state changes
+        // (initial launch counts: prev is all-None, new is populated).
+        let network_changed = prev_info.local_v4 != new_info.local_v4
+            || prev_info.local_v6 != new_info.local_v6
+            || prev_info.router_v4 != new_info.router_v4
+            || prev_info.router_v6 != new_info.router_v6
+            || prev_info.vpn_interface != new_info.vpn_interface;
+        if network_changed {
+            fetch_public_ips(ivars.public_v4.clone(), ivars.public_v6.clone());
+        }
+
+        let public = self.public_snapshot();
+        let new_ip_row_count = ip_entries(&new_info, &public).len();
+        let structure_changed = ivars.ip_rows.borrow().len() != new_ip_row_count
+            || ivars.dns_rows.borrow().len() != new_info.dns_ips.len().max(1)
+            || ivars.target_rows.borrow().len() != ivars.targets.borrow().len()
+            || prev_info.router_v4.is_some() != new_info.router_v4.is_some()
+            || prev_info.vpn_interface.is_some() != new_info.vpn_interface.is_some();
 
         *ivars.net_info.borrow_mut() = new_info.clone();
 
@@ -208,10 +251,18 @@ impl AppDelegate {
         self.update_titles(mtm, &new_info);
     }
 
+    fn public_snapshot(&self) -> (Option<String>, Option<String>) {
+        let ivars = self.ivars();
+        (
+            ivars.public_v4.lock().unwrap().clone(),
+            ivars.public_v6.lock().unwrap().clone(),
+        )
+    }
+
     fn host_list(&self, info: &NetInfo) -> Vec<String> {
         let targets = self.ivars().targets.borrow();
         let mut hosts: Vec<String> = targets.iter().map(|t| t.host.clone()).collect();
-        if let Some(ip) = &info.router_ip {
+        if let Some(ip) = &info.router_v4 {
             hosts.push(ip.clone());
         }
         hosts.extend(info.dns_ips.iter().cloned());
@@ -223,27 +274,48 @@ impl AppDelegate {
         let menu = &ivars.menu;
         menu.removeAllItems();
 
-        // Resize target_items to match current targets.
+        // Connectivity aggregate + router latency at top.
+        menu.addItem(&ivars.internet_row.item);
+        menu.addItem(&ivars.router_row.item);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Per-target rows.
         let target_count = ivars.targets.borrow().len();
         {
-            let mut items = ivars.target_items.borrow_mut();
-            items.resize_with(target_count, || info_item(mtm));
-            for item in items.iter() {
-                menu.addItem(item);
+            let mut rows = ivars.target_rows.borrow_mut();
+            rows.resize_with(target_count, || InfoRow::new(mtm));
+            for row in rows.iter() {
+                menu.addItem(&row.item);
             }
         }
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&ivars.local_item);
-        menu.addItem(&ivars.router_item);
 
-        // Resize dns_items to match current DNS count (or one placeholder if empty).
+        // DNS rows (with sparkline + latency).
         {
-            let mut items = ivars.dns_items.borrow_mut();
-            let target_count = info.dns_ips.len().max(1);
-            items.resize_with(target_count, || info_item(mtm));
-            for item in items.iter() {
-                menu.addItem(item);
+            let mut rows = ivars.dns_rows.borrow_mut();
+            let row_count = info.dns_ips.len().max(1);
+            rows.resize_with(row_count, || InfoRow::new(mtm));
+            for row in rows.iter() {
+                menu.addItem(&row.item);
+            }
+        }
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Network info block: VPN status (when active) then IP chip rows
+        // (Local, Router, Public) with click-to-copy v4/v6 chips.
+        if info.vpn_interface.is_some() {
+            menu.addItem(&ivars.vpn_row.item);
+        }
+        {
+            let public = self.public_snapshot();
+            let entries = ip_entries(info, &public);
+            let mut rows = ivars.ip_rows.borrow_mut();
+            rows.resize_with(entries.len(), || NetInfoRow::new(mtm, self as &AnyObject));
+            for row in rows.iter() {
+                menu.addItem(&row.item);
             }
         }
 
@@ -257,78 +329,107 @@ impl AppDelegate {
         let ivars = self.ivars();
         let targets = ivars.targets.borrow();
         let snapshot = ivars.ping_service.snapshot();
+        let now = Instant::now();
 
         // Snapshot layout: [targets..., router?, dns...]
         let target_count = targets.len();
-        let target_results = &snapshot.get(..target_count).unwrap_or(&[]);
+        let target_snaps: &[HostSnapshot] = snapshot.get(..target_count).unwrap_or(&[]);
         let mut idx = target_count;
-        let router_result = if info.router_ip.is_some() {
-            let r = snapshot.get(idx).cloned().unwrap_or(PingResult::Pending);
+        let router_snap: Option<&HostSnapshot> = if info.router_v4.is_some() {
+            let r = snapshot.get(idx);
             idx += 1;
-            Some(r)
+            r
         } else {
             None
         };
-        let dns_results: Vec<PingResult> = snapshot.get(idx..).unwrap_or(&[]).to_vec();
+        let dns_snaps: &[HostSnapshot] = snapshot.get(idx..).unwrap_or(&[]);
 
-        // Status bar.
+        // Internet aggregate: best-of-N across user targets.
+        let target_buckets: Vec<Vec<sparkline::BucketInfo>> = target_snaps
+            .iter()
+            .map(|s| sparkline::bucketize(&s.samples, now))
+            .collect();
+        let internet_buckets = sparkline::best_of(&target_buckets);
+        let internet_current = aggregate_best(target_snaps);
+
+        // Status bar tracks the Internet aggregate as a 4-cell mini sparkline.
         if let Some(button) = ivars.status_item.button(mtm) {
-            let title = if targets.is_empty() {
-                "\u{1F310} --".to_string()
-            } else {
-                match target_results.first().cloned().unwrap_or(PingResult::Pending) {
-                    PingResult::Ok(ms) => format!("\u{1F310} {ms:.0}ms"),
-                    PingResult::Timeout => "\u{1F310} ---".to_string(),
-                    PingResult::Error(_) => "\u{1F310} err".to_string(),
-                    PingResult::Pending => "\u{1F310} ...".to_string(),
-                }
+            let image = make_status_image(&internet_buckets);
+            button.setImage(Some(&image));
+            button.setTitle(ns_string!(""));
+            // Silence the "err"/"ms" hint we'd otherwise lose by surfacing
+            // the current state in the button's tooltip.
+            let hint = match &internet_current {
+                PingResult::Ok(ms) => format!("Internet: {ms:.1} ms"),
+                PingResult::Timeout => "Internet: timeout".to_string(),
+                PingResult::Error(e) => format!("Internet: {e}"),
+                PingResult::Pending => "Internet: …".to_string(),
             };
-            button.setTitle(&NSString::from_str(&title));
+            button.setToolTip(Some(&NSString::from_str(&hint)));
         }
 
-        // Target items.
-        let target_items = ivars.target_items.borrow();
+        // Internet row.
+        ivars
+            .internet_row
+            .set("Internet", internet_buckets, &format_result(&internet_current));
+
+        // Router row (sparkline + latency).
+        match router_snap {
+            Some(s) => {
+                let buckets = sparkline::bucketize(&s.samples, now);
+                ivars.router_row.set("Router", buckets, &format_result(&s.current));
+            }
+            None => ivars.router_row.set("Router", vec![], "unknown"),
+        }
+
+        // Per-target rows.
+        let target_rows = ivars.target_rows.borrow();
         for (i, target) in targets.iter().enumerate() {
-            if let Some(item) = target_items.get(i) {
-                let result = target_results
-                    .get(i)
-                    .cloned()
-                    .unwrap_or(PingResult::Pending);
-                let text = format!("{}: {}", target.name, format_result(&result));
-                item.setTitle(&NSString::from_str(&text));
+            if let Some(row) = target_rows.get(i) {
+                let (current, buckets) = match target_snaps.get(i) {
+                    Some(s) => (s.current.clone(), sparkline::bucketize(&s.samples, now)),
+                    None => (PingResult::Pending, vec![]),
+                };
+                row.set(&target.host, buckets, &format_result(&current));
             }
         }
 
-        // Local IP.
-        let local_text = format!(
-            "Local IP: {}",
-            info.local_ip.as_deref().unwrap_or("unknown")
-        );
-        ivars.local_item.setTitle(&NSString::from_str(&local_text));
-
-        // Router.
-        let router_text = match (info.router_ip.as_deref(), router_result) {
-            (Some(ip), Some(r)) => format!("Router {ip}: {}", format_result(&r)),
-            _ => "Router: unknown".to_string(),
-        };
-        ivars.router_item.setTitle(&NSString::from_str(&router_text));
-
-        // DNS items.
-        let dns_items = ivars.dns_items.borrow();
+        // DNS rows: sparkline + latency. Strip IPv6 zone-id suffix for display
+        // (e.g. "fe80::...%en0" → "fe80::...").
+        let dns_rows = ivars.dns_rows.borrow();
         if info.dns_ips.is_empty() {
-            if let Some(item) = dns_items.first() {
-                item.setTitle(ns_string!("DNS: unknown"));
+            if let Some(row) = dns_rows.first() {
+                row.set("DNS: unknown", vec![], "");
             }
         } else {
             for (i, ip) in info.dns_ips.iter().enumerate() {
-                if let Some(item) = dns_items.get(i) {
-                    let result = dns_results
-                        .get(i)
-                        .cloned()
-                        .unwrap_or(PingResult::Pending);
-                    let text = format!("DNS {ip}: {}", format_result(&result));
-                    item.setTitle(&NSString::from_str(&text));
+                if let Some(row) = dns_rows.get(i) {
+                    let display_ip = ip.split('%').next().unwrap_or(ip);
+                    let (current, buckets) = match dns_snaps.get(i) {
+                        Some(s) => (s.current.clone(), sparkline::bucketize(&s.samples, now)),
+                        None => (PingResult::Pending, vec![]),
+                    };
+                    row.set(&format!("DNS {display_ip}"), buckets, &format_result(&current));
                 }
+            }
+        }
+
+        // VPN status (text-only).
+        if let Some(iface) = &info.vpn_interface {
+            ivars.vpn_row.set(&format!("VPN: active ({iface})"), vec![], "");
+        }
+
+        // IP chip rows.
+        let public = self.public_snapshot();
+        let entries = ip_entries(info, &public);
+        let ip_rows = ivars.ip_rows.borrow();
+        for (i, entry) in entries.iter().enumerate() {
+            if let Some(row) = ip_rows.get(i) {
+                row.set(
+                    &format!("{}:", entry.label),
+                    entry.v4.as_deref(),
+                    entry.v6.as_deref(),
+                );
             }
         }
     }
@@ -384,6 +485,568 @@ impl AppDelegate {
     }
 }
 
+struct IpEntry {
+    label: &'static str,
+    v4: Option<String>,
+    v6: Option<String>,
+}
+
+/// The set of IP-chip rows to display, in order. Each entry shows a label
+/// plus one or two clickable address chips; entries with neither v4 nor v6
+/// are omitted.
+fn ip_entries(
+    info: &NetInfo,
+    public: &(Option<String>, Option<String>),
+) -> Vec<IpEntry> {
+    let mut rows = Vec::new();
+    if info.local_v4.is_some() || info.local_v6.is_some() {
+        rows.push(IpEntry {
+            label: "Local",
+            v4: info.local_v4.clone(),
+            v6: info.local_v6.clone(),
+        });
+    }
+    if info.router_v4.is_some() || info.router_v6.is_some() {
+        rows.push(IpEntry {
+            label: "Router",
+            v4: info.router_v4.clone(),
+            v6: info.router_v6.clone(),
+        });
+    }
+    if public.0.is_some() || public.1.is_some() {
+        rows.push(IpEntry {
+            label: "Public",
+            v4: public.0.clone(),
+            v6: public.1.clone(),
+        });
+    }
+    rows
+}
+
+/// Kick off background fetches for the public IPv4 and IPv6 addresses via
+/// `api.ipify.org`. The v4 and v6 hostnames have only A and only AAAA
+/// records respectively, so the address family is forced by DNS — no need
+/// to bind locally or pin a route. Each fetch runs in its own short-lived
+/// thread, writes to the shared slot on success, or clears it on failure.
+fn fetch_public_ips(v4_slot: Arc<Mutex<Option<String>>>, v6_slot: Arc<Mutex<Option<String>>>) {
+    fetch_one("https://api.ipify.org", v4_slot);
+    fetch_one("https://api6.ipify.org", v6_slot);
+}
+
+fn fetch_one(url: &'static str, slot: Arc<Mutex<Option<String>>>) {
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .build();
+        let new_value = agent
+            .get(url)
+            .call()
+            .ok()
+            .and_then(|resp| resp.into_string().ok())
+            .and_then(|s| {
+                let t = s.trim();
+                if t.is_empty() || t.len() > 64 {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            });
+        if let Ok(mut g) = slot.lock() {
+            *g = new_value;
+        }
+    });
+}
+
+/// Best-of-N across snapshots' current results. If any target is Ok, return
+/// the minimum-latency Ok. Otherwise return Pending if any is Pending, else
+/// Timeout/Error.
+fn aggregate_best(snaps: &[HostSnapshot]) -> PingResult {
+    if snaps.is_empty() {
+        return PingResult::Pending;
+    }
+    let best_ok: Option<f64> = snaps
+        .iter()
+        .filter_map(|s| match s.current {
+            PingResult::Ok(ms) => Some(ms),
+            _ => None,
+        })
+        .fold(None, |acc, ms| Some(acc.map_or(ms, |a: f64| a.min(ms))));
+    if let Some(ms) = best_ok {
+        return PingResult::Ok(ms);
+    }
+    if snaps.iter().any(|s| matches!(s.current, PingResult::Pending)) {
+        return PingResult::Pending;
+    }
+    if snaps.iter().any(|s| matches!(s.current, PingResult::Timeout)) {
+        return PingResult::Timeout;
+    }
+    PingResult::Error("all targets failed".to_string())
+}
+
+const SPARK_CELL_W: f64 = 5.0;
+const SPARK_GAP: f64 = 2.0;
+const SPARK_HEIGHT: f64 = 11.0;
+const SPARK_RADIUS: f64 = 1.5;
+const LATENCY_WIDTH: f64 = 70.0;
+
+fn spark_total_width() -> f64 {
+    let n = sparkline::BUCKET_COUNT as f64;
+    n * SPARK_CELL_W + (n - 1.0) * SPARK_GAP
+}
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = SparklineViewIvars]
+    struct SparklineView;
+
+    impl SparklineView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: CGRect) {
+            self.do_draw();
+        }
+
+        #[unsafe(method(intrinsicContentSize))]
+        fn intrinsic_content_size(&self) -> CGSize {
+            CGSize::new(spark_total_width(), SPARK_HEIGHT)
+        }
+
+        /// NSToolTipOwner informal protocol: AppKit invokes this when the
+        /// pointer hovers over a registered tooltip rect. We encoded the
+        /// bucket index in `data` when we registered each rect.
+        #[unsafe(method_id(view:stringForToolTip:point:userData:))]
+        unsafe fn provide_tooltip(
+            &self,
+            _view: &NSView,
+            _tag: NSToolTipTag,
+            _point: CGPoint,
+            data: *mut c_void,
+        ) -> Retained<NSString> {
+            let idx = data as usize;
+            let tooltips = self.ivars().tooltips.borrow();
+            let text = tooltips.get(idx).map(String::as_str).unwrap_or("");
+            NSString::from_str(text)
+        }
+    }
+);
+
+struct SparklineViewIvars {
+    cells: RefCell<Vec<sparkline::BucketInfo>>,
+    tooltips: RefCell<Vec<String>>,
+}
+
+impl SparklineView {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SparklineViewIvars {
+            cells: RefCell::new(Vec::new()),
+            tooltips: RefCell::new(vec![String::new(); sparkline::BUCKET_COUNT]),
+        });
+        let view: Retained<Self> = unsafe { msg_send![super(this), init] };
+        view.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        // Register one tooltip rect per bucket; userData carries the index.
+        let owner: &AnyObject = &view;
+        for i in 0..sparkline::BUCKET_COUNT {
+            let x = (i as f64) * (SPARK_CELL_W + SPARK_GAP);
+            let rect = CGRect::new(
+                CGPoint::new(x, 0.0),
+                CGSize::new(SPARK_CELL_W, SPARK_HEIGHT),
+            );
+            unsafe {
+                view.addToolTipRect_owner_userData(rect, owner, i as *mut c_void);
+            }
+        }
+
+        view
+    }
+
+    fn set_buckets(&self, buckets: Vec<sparkline::BucketInfo>) {
+        let tooltips: Vec<String> = buckets.iter().map(format_bucket_tooltip).collect();
+        *self.ivars().cells.borrow_mut() = buckets;
+        *self.ivars().tooltips.borrow_mut() = tooltips;
+        self.setNeedsDisplay(true);
+    }
+
+    fn do_draw(&self) {
+        let cells = self.ivars().cells.borrow();
+        let bounds = self.bounds();
+        let y = (bounds.size.height - SPARK_HEIGHT) / 2.0;
+        for (i, bucket) in cells.iter().enumerate() {
+            let x = (i as f64) * (SPARK_CELL_W + SPARK_GAP);
+            let rect = CGRect::new(
+                CGPoint::new(x, y),
+                CGSize::new(SPARK_CELL_W, SPARK_HEIGHT),
+            );
+            cell_color(bucket).setFill();
+            let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                rect,
+                SPARK_RADIUS,
+                SPARK_RADIUS,
+            );
+            path.fill();
+        }
+    }
+}
+
+// Status-bar mini sparkline geometry.
+const STATUS_CELLS: usize = 4;
+const STATUS_CELL_W: f64 = 4.0;
+const STATUS_GAP: f64 = 1.5;
+const STATUS_HEIGHT: f64 = 11.0;
+const STATUS_RADIUS: f64 = 1.0;
+
+/// Build the status-bar image: the most recent `STATUS_CELLS` buckets of
+/// the Internet aggregate, drawn as a tiny gradient sparkline.
+fn make_status_image(buckets: &[sparkline::BucketInfo]) -> Retained<NSImage> {
+    let width = STATUS_CELLS as f64 * STATUS_CELL_W + (STATUS_CELLS - 1) as f64 * STATUS_GAP;
+    let size = CGSize::new(width, STATUS_HEIGHT);
+    let image = NSImage::initWithSize(NSImage::alloc(), size);
+    // `lockFocus` / `unlockFocus` are flagged deprecated in favor of
+    // `imageWithSize:flipped:drawingHandler:`, but that needs a block (extra
+    // dep). For a tiny status-bar icon redrawn every tick this is fine.
+    #[allow(deprecated)]
+    image.lockFocus();
+
+    let start = buckets.len().saturating_sub(STATUS_CELLS);
+    let tail = &buckets[start..];
+    for (i, bucket) in tail.iter().enumerate() {
+        let x = (i as f64) * (STATUS_CELL_W + STATUS_GAP);
+        let rect = CGRect::new(
+            CGPoint::new(x, 0.0),
+            CGSize::new(STATUS_CELL_W, STATUS_HEIGHT),
+        );
+        cell_color(bucket).setFill();
+        let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            rect,
+            STATUS_RADIUS,
+            STATUS_RADIUS,
+        );
+        path.fill();
+    }
+
+    // Pad on the left with empty cells if the history doesn't have enough
+    // recent buckets yet (e.g. right after launch).
+    for i in tail.len()..STATUS_CELLS {
+        let x = (i as f64) * (STATUS_CELL_W + STATUS_GAP);
+        let rect = CGRect::new(
+            CGPoint::new(x, 0.0),
+            CGSize::new(STATUS_CELL_W, STATUS_HEIGHT),
+        );
+        NSColor::tertiaryLabelColor().setFill();
+        let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            rect,
+            STATUS_RADIUS,
+            STATUS_RADIUS,
+        );
+        path.fill();
+    }
+
+    #[allow(deprecated)]
+    image.unlockFocus();
+    // Don't tint with the system template color — we want our own gradient.
+    image.setTemplate(false);
+    image
+}
+
+/// Color for a single sparkline cell. Empty cells use the system's tertiary
+/// label gray; otherwise the bucket's badness score maps onto a hue gradient
+/// (green → yellow → red).
+fn cell_color(b: &sparkline::BucketInfo) -> Retained<NSColor> {
+    match sparkline::badness(b) {
+        None => NSColor::tertiaryLabelColor(),
+        Some(score) => gradient_color(score),
+    }
+}
+
+fn gradient_color(score: f64) -> Retained<NSColor> {
+    let t = score.clamp(0.0, 1.0) as f64;
+    // Hue: green ≈ 120°/360 = 0.333 at t=0, red = 0 at t=1; yellow naturally
+    // appears around t ≈ 0.5 (60°). Slightly desaturated for menu rendering.
+    let hue = (1.0 - t) * 0.333;
+    NSColor::colorWithHue_saturation_brightness_alpha(hue, 0.78, 0.85, 1.0)
+}
+
+fn format_bucket_tooltip(b: &sparkline::BucketInfo) -> String {
+    if b.samples == 0 {
+        return "no data".to_string();
+    }
+    let loss_pct = b.loss_rate() * 100.0;
+    match (b.max_ok_ms, b.failed > 0) {
+        (Some(ms), false) => format!("{ms:.1} ms"),
+        (Some(ms), true) => format!("{ms:.1} ms · {loss_pct:.0}% loss"),
+        (None, _) => "all timeouts".to_string(),
+    }
+}
+
+/// A menu row with a custom NSView containing a left label, a sparkline
+/// view, and a right (latency) label. The right label is pinned to the
+/// view's trailing edge with a fixed width, and the sparkline is pinned
+/// immediately to its left with a fixed width — so the sparkline column
+/// has the same x position across every row.
+struct InfoRow {
+    item: Retained<NSMenuItem>,
+    left: Retained<NSTextField>,
+    sparkline: Retained<SparklineView>,
+    right: Retained<NSTextField>,
+}
+
+impl InfoRow {
+    fn new(mtm: MainThreadMarker) -> Self {
+        let item = NSMenuItem::new(mtm);
+        item.setEnabled(true);
+
+        let view = NSView::new(mtm);
+        view.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let left = NSTextField::labelWithString(ns_string!(""), mtm);
+        let right = NSTextField::labelWithString(ns_string!(""), mtm);
+        let font = NSFont::menuFontOfSize(0.0);
+        left.setFont(Some(&font));
+        right.setFont(Some(&font));
+        right.setAlignment(NSTextAlignment::Right);
+        left.setTranslatesAutoresizingMaskIntoConstraints(false);
+        right.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let sparkline = SparklineView::new(mtm);
+
+        view.addSubview(&left);
+        view.addSubview(&sparkline);
+        view.addSubview(&right);
+
+        const H_MARGIN: f64 = 14.0;
+        const V_MARGIN: f64 = 3.0;
+        const SPACING: f64 = 10.0;
+
+        let left_obj: &AnyObject = &left;
+        let spark_obj: &AnyObject = &sparkline;
+        let right_obj: &AnyObject = &right;
+        let view_obj: &AnyObject = &view;
+        unsafe {
+            for c in [
+                // Vertical alignment + view height.
+                pin(left_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(spark_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(right_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(left_obj, NSLayoutAttribute::Top, view_obj, NSLayoutAttribute::Top, V_MARGIN),
+                pin(view_obj, NSLayoutAttribute::Bottom, left_obj, NSLayoutAttribute::Bottom, V_MARGIN),
+
+                // Right column: fixed width, pinned to view trailing.
+                pin(right_obj, NSLayoutAttribute::Trailing, view_obj, NSLayoutAttribute::Trailing, -H_MARGIN),
+                pin_const(right_obj, NSLayoutAttribute::Width, LATENCY_WIDTH),
+
+                // Sparkline: fixed width, pinned immediately left of the right column.
+                pin(spark_obj, NSLayoutAttribute::Trailing, right_obj, NSLayoutAttribute::Leading, -SPACING),
+                pin_const(spark_obj, NSLayoutAttribute::Width, spark_total_width()),
+                pin_const(spark_obj, NSLayoutAttribute::Height, SPARK_HEIGHT),
+
+                // Left label: leading edge of view, may shrink up to the sparkline.
+                pin(left_obj, NSLayoutAttribute::Leading, view_obj, NSLayoutAttribute::Leading, H_MARGIN),
+                pin_rel(
+                    left_obj,
+                    NSLayoutAttribute::Trailing,
+                    NSLayoutRelation::LessThanOrEqual,
+                    spark_obj,
+                    NSLayoutAttribute::Leading,
+                    -SPACING,
+                ),
+            ] {
+                c.setActive(true);
+            }
+        }
+
+        item.setView(Some(&view));
+
+        InfoRow { item, left, sparkline, right }
+    }
+
+    fn set(&self, left: &str, buckets: Vec<sparkline::BucketInfo>, right: &str) {
+        self.left.setStringValue(&NSString::from_str(left));
+        self.right.setStringValue(&NSString::from_str(right));
+        self.sparkline.set_buckets(buckets);
+    }
+}
+
+/// Network-info row that displays the label plus one or two clickable IP
+/// "chips" (v4 + v6). Each chip is a click-to-copy button — title is the
+/// plain IP, the visual styling (font + color) is set through an attributed
+/// title so v4 and v6 are visually distinct and v6 is rendered in a more
+/// compact font to fit.
+struct NetInfoRow {
+    item: Retained<NSMenuItem>,
+    label: Retained<NSTextField>,
+    v4: Retained<NSButton>,
+    v6: Retained<NSButton>,
+}
+
+#[derive(Clone, Copy)]
+enum ChipKind {
+    V4,
+    V6,
+}
+
+impl NetInfoRow {
+    fn new(mtm: MainThreadMarker, copy_target: &AnyObject) -> Self {
+        let item = NSMenuItem::new(mtm);
+        item.setEnabled(true);
+
+        let view = NSView::new(mtm);
+        view.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let label = NSTextField::labelWithString(ns_string!(""), mtm);
+        label.setFont(Some(&NSFont::menuFontOfSize(0.0)));
+        label.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let v4 = make_chip(mtm, copy_target);
+        let v6 = make_chip(mtm, copy_target);
+
+        view.addSubview(&label);
+        view.addSubview(&v4);
+        view.addSubview(&v6);
+
+        const H_MARGIN: f64 = 14.0;
+        const V_MARGIN: f64 = 3.0;
+        const SPACING: f64 = 8.0;
+
+        let label_obj: &AnyObject = &label;
+        let v4_obj: &AnyObject = &v4;
+        let v6_obj: &AnyObject = &v6;
+        let view_obj: &AnyObject = &view;
+        unsafe {
+            for c in [
+                pin(label_obj, NSLayoutAttribute::Leading, view_obj, NSLayoutAttribute::Leading, H_MARGIN),
+                pin(label_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(label_obj, NSLayoutAttribute::Top, view_obj, NSLayoutAttribute::Top, V_MARGIN),
+                pin(view_obj, NSLayoutAttribute::Bottom, label_obj, NSLayoutAttribute::Bottom, V_MARGIN),
+                pin(v4_obj, NSLayoutAttribute::Leading, label_obj, NSLayoutAttribute::Trailing, SPACING),
+                pin(v4_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(v6_obj, NSLayoutAttribute::Leading, v4_obj, NSLayoutAttribute::Trailing, SPACING),
+                pin(v6_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(view_obj, NSLayoutAttribute::Trailing, v6_obj, NSLayoutAttribute::Trailing, H_MARGIN),
+            ] {
+                c.setActive(true);
+            }
+        }
+
+        item.setView(Some(&view));
+        NetInfoRow { item, label, v4, v6 }
+    }
+
+    fn set(&self, label: &str, v4: Option<&str>, v6: Option<&str>) {
+        self.label.setStringValue(&NSString::from_str(label));
+        set_chip(&self.v4, ChipKind::V4, v4);
+        set_chip(&self.v6, ChipKind::V6, v6);
+    }
+}
+
+fn make_chip(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSButton> {
+    let btn = NSButton::new(mtm);
+    btn.setBordered(false);
+    btn.setTitle(ns_string!(""));
+    btn.setTranslatesAutoresizingMaskIntoConstraints(false);
+    unsafe {
+        btn.setTarget(Some(target));
+        btn.setAction(Some(sel!(copyIp:)));
+    }
+    btn.setHidden(true);
+    let tooltip = NSString::from_str("click to copy");
+    btn.setToolTip(Some(&tooltip));
+    btn
+}
+
+fn set_chip(btn: &NSButton, kind: ChipKind, ip: Option<&str>) {
+    match ip {
+        Some(s) if !s.is_empty() => {
+            btn.setHidden(false);
+            // Plain title (used as the pasteboard payload on click).
+            btn.setTitle(&NSString::from_str(s));
+            // Attributed title is just for display (font + color); the
+            // button still reports its plain `title` for copy.
+            let attr = chip_attributed_title(kind, s);
+            btn.setAttributedTitle(&attr);
+        }
+        _ => btn.setHidden(true),
+    }
+}
+
+fn chip_attributed_title(kind: ChipKind, ip: &str) -> Retained<NSAttributedString> {
+    let (font, color) = match kind {
+        ChipKind::V4 => (
+            NSFont::monospacedSystemFontOfSize_weight(12.0, unsafe { NSFontWeightRegular }),
+            NSColor::systemBlueColor(),
+        ),
+        ChipKind::V6 => (
+            // Smaller monospaced font for v6 — IPv6 addresses are long and
+            // we want them to take less horizontal space than v4.
+            NSFont::monospacedSystemFontOfSize_weight(10.0, unsafe { NSFontWeightRegular }),
+            NSColor::systemIndigoColor(),
+        ),
+    };
+    let key_color: &NSString = unsafe { NSForegroundColorAttributeName };
+    let key_font: &NSString = unsafe { NSFontAttributeName };
+    let attrs = NSDictionary::from_slices::<NSString>(
+        &[key_color, key_font],
+        &[color.as_ref() as &AnyObject, font.as_ref() as &AnyObject],
+    );
+    let s = NSString::from_str(ip);
+    unsafe {
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &s,
+            Some(&attrs),
+        )
+    }
+}
+
+unsafe fn pin(
+    a: &AnyObject,
+    a_attr: NSLayoutAttribute,
+    b: &AnyObject,
+    b_attr: NSLayoutAttribute,
+    constant: f64,
+) -> Retained<NSLayoutConstraint> {
+    unsafe { pin_rel(a, a_attr, NSLayoutRelation::Equal, b, b_attr, constant) }
+}
+
+unsafe fn pin_rel(
+    a: &AnyObject,
+    a_attr: NSLayoutAttribute,
+    relation: NSLayoutRelation,
+    b: &AnyObject,
+    b_attr: NSLayoutAttribute,
+    constant: f64,
+) -> Retained<NSLayoutConstraint> {
+    unsafe {
+        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            a,
+            a_attr,
+            relation,
+            Some(b),
+            b_attr,
+            1.0,
+            constant,
+        )
+    }
+}
+
+/// Constant constraint: `a.attr == constant` (no other item).
+unsafe fn pin_const(
+    a: &AnyObject,
+    a_attr: NSLayoutAttribute,
+    constant: f64,
+) -> Retained<NSLayoutConstraint> {
+    unsafe {
+        NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            a,
+            a_attr,
+            NSLayoutRelation::Equal,
+            None,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            constant,
+        )
+    }
+}
+
 fn format_result(result: &PingResult) -> String {
     match result {
         PingResult::Ok(ms) => format!("{ms:.1}ms"),
@@ -391,12 +1054,6 @@ fn format_result(result: &PingResult) -> String {
         PingResult::Error(e) => e.clone(),
         PingResult::Pending => "...".to_string(),
     }
-}
-
-fn info_item(mtm: MainThreadMarker) -> Retained<NSMenuItem> {
-    let item = NSMenuItem::new(mtm);
-    item.setEnabled(true);
-    item
 }
 
 fn create_menu_item(
@@ -410,11 +1067,43 @@ fn create_menu_item(
     item
 }
 
+fn install_main_menu(mtm: MainThreadMarker, app: &NSApplication) {
+    let main = NSMenu::new(mtm);
+
+    // Edit submenu with nil-targeted standard selectors. AppKit dispatches
+    // these through the first responder, so they reach the focused text field
+    // even though this is an LSUIElement (accessory) app.
+    let edit_item = NSMenuItem::new(mtm);
+    edit_item.setTitle(ns_string!("Edit"));
+    let edit_menu = NSMenu::new(mtm);
+    edit_menu.setTitle(ns_string!("Edit"));
+
+    let entries: &[(&NSString, Sel, &NSString)] = &[
+        (ns_string!("Undo"), sel!(undo:), ns_string!("z")),
+        (ns_string!("Redo"), sel!(redo:), ns_string!("Z")),
+        (ns_string!("Cut"), sel!(cut:), ns_string!("x")),
+        (ns_string!("Copy"), sel!(copy:), ns_string!("c")),
+        (ns_string!("Paste"), sel!(paste:), ns_string!("v")),
+        (ns_string!("Select All"), sel!(selectAll:), ns_string!("a")),
+    ];
+    for (title, action, key) in entries {
+        let item = create_menu_item(mtm, title, Some(*action));
+        item.setKeyEquivalent(key);
+        edit_menu.addItem(&item);
+    }
+
+    edit_item.setSubmenu(Some(&edit_menu));
+    main.addItem(&edit_item);
+
+    app.setMainMenu(Some(&main));
+}
+
 fn main() {
     let mtm = MainThreadMarker::new().unwrap();
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    install_main_menu(mtm, &app);
 
     let delegate = AppDelegate::new(mtm);
     let object = ProtocolObject::from_ref(&*delegate);
