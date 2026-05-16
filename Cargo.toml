@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+surge-ping = "0.8"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+rand = "0.8"
 objc2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false }
 objc2-foundation = { version = "0.3", default-features = false, features = [
@@ -16,6 +20,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSNotification",
     "NSObject",
     "NSProcessInfo",
+    "NSRunLoop",
     "NSString",
     "NSThread",
     "NSTimer",
