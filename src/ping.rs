@@ -1,15 +1,34 @@
 use std::collections::VecDeque;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use surge_ping::{Client, Config, ICMP, PingIdentifier, PingSequence, Pinger, SurgeError};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Ports raced by the TCP prober — chosen because home routers commonly
+/// expose at least one (HTTP UI, HTTPS UI, DNS forwarder, TR-069/CWMP).
+/// A `ECONNREFUSED` counts as a success: it still proves the router
+/// responded, which is the only thing we're measuring.
+const TCP_PROBE_PORTS: &[u16] = &[80, 443, 53, 7547];
 const HISTORY_RETENTION: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeKind {
+    Icmp,
+    Tcp,
+}
+
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub host: String,
+    pub kind: ProbeKind,
+}
 
 #[derive(Clone, Debug)]
 pub struct PingTarget {
@@ -53,9 +72,17 @@ struct ServiceState {
 
 struct Slot {
     host: String,
+    kind: ProbeKind,
     result: Arc<Mutex<PingResult>>,
     samples: Arc<Mutex<VecDeque<Sample>>>,
     task: JoinHandle<()>,
+}
+
+/// The per-target probing strategy. Built once at slot-creation time and
+/// reused for every tick of `target_loop`.
+enum Prober {
+    Icmp(Pinger),
+    Tcp(IpAddr),
 }
 
 impl PingService {
@@ -85,20 +112,23 @@ impl PingService {
         }
     }
 
-    /// Replace the set of hosts being pinged. Unchanged hosts keep their
-    /// current result and in-flight task; new hosts start in Pending; removed
-    /// hosts are aborted.
-    pub fn set_targets(&self, hosts: &[String]) {
+    /// Replace the set of probes being run. Unchanged (host, kind) entries
+    /// keep their current result and in-flight task; new entries start in
+    /// Pending; removed entries are aborted.
+    pub fn set_targets(&self, probes: &[Probe]) {
         let mut state = self.state.lock().unwrap();
 
         // Drain existing slots into a map keyed by host so we can reuse them.
         let mut existing: Vec<Option<Slot>> = state.slots.drain(..).map(Some).collect();
 
-        let mut new_slots: Vec<Slot> = Vec::with_capacity(hosts.len());
-        for host in hosts {
+        let mut new_slots: Vec<Slot> = Vec::with_capacity(probes.len());
+        for probe in probes {
             let reused = existing
                 .iter_mut()
-                .find(|s| s.as_ref().is_some_and(|s| &s.host == host))
+                .find(|s| {
+                    s.as_ref()
+                        .is_some_and(|s| s.host == probe.host && s.kind == probe.kind)
+                })
                 .and_then(|s| s.take());
             match reused {
                 Some(slot) => new_slots.push(slot),
@@ -106,7 +136,7 @@ impl PingService {
                     let result = Arc::new(Mutex::new(PingResult::Pending));
                     let samples = Arc::new(Mutex::new(VecDeque::new()));
                     let interval_rx = self.interval_tx.subscribe();
-                    // Build the Pinger here, not inside the task. Surge-ping's
+                    // Build the Prober here, not inside the task. Surge-ping's
                     // `Drop for Client` unconditionally marks the shared reply
                     // map as destroyed; if we cloned `Client` into the task
                     // and the task ever ended (e.g. set_targets aborts it on
@@ -114,16 +144,17 @@ impl PingService {
                     // start returning `ClientDestroyed`. By creating the
                     // Pinger here we keep the only Client clones inside
                     // `self.v4`/`self.v6`, which live for the whole process.
-                    let pinger =
-                        self.handle.block_on(setup_pinger(host, &self.v4, &self.v6));
+                    let prober =
+                        self.handle.block_on(setup_prober(probe, &self.v4, &self.v6));
                     let task = self.handle.spawn(target_loop(
-                        pinger,
+                        prober,
                         result.clone(),
                         samples.clone(),
                         interval_rx,
                     ));
                     new_slots.push(Slot {
-                        host: host.clone(),
+                        host: probe.host.clone(),
+                        kind: probe.kind,
                         result,
                         samples,
                         task,
@@ -159,24 +190,27 @@ impl PingService {
 }
 
 async fn target_loop(
-    mut setup: Result<Pinger, String>,
+    mut prober: Result<Prober, String>,
     result: Arc<Mutex<PingResult>>,
     samples: Arc<Mutex<VecDeque<Sample>>>,
     mut interval_rx: watch::Receiver<Duration>,
 ) {
-    // The Pinger is built by the caller (PingService::set_targets) so that
-    // Client clones never live inside a task body; see the comment in
-    // set_targets for the full rationale.
+    // The Prober is built by the caller (PingService::set_targets) so that
+    // surge-ping Client clones never live inside a task body; see the comment
+    // in set_targets for the full rationale.
     let mut seq: u16 = 0;
     loop {
         let start = Instant::now();
-        let r = match &mut setup {
-            Ok(pinger) => match pinger.ping(PingSequence(seq), &[0u8; 32]).await {
-                Ok((_pkt, dur)) => PingResult::Ok(dur.as_secs_f64() * 1000.0),
-                Err(SurgeError::Timeout { .. }) => PingResult::Timeout,
-                Err(SurgeError::IOError(e)) => PingResult::Error(clean_io_error(&e)),
-                Err(e) => PingResult::Error(e.to_string()),
-            },
+        let r = match &mut prober {
+            Ok(Prober::Icmp(pinger)) => {
+                match pinger.ping(PingSequence(seq), &[0u8; 32]).await {
+                    Ok((_pkt, dur)) => PingResult::Ok(dur.as_secs_f64() * 1000.0),
+                    Err(SurgeError::Timeout { .. }) => PingResult::Timeout,
+                    Err(SurgeError::IOError(e)) => PingResult::Error(clean_io_error(&e)),
+                    Err(e) => PingResult::Error(e.to_string()),
+                }
+            }
+            Ok(Prober::Tcp(addr)) => tcp_probe(*addr).await,
             Err(e) => PingResult::Error(e.clone()),
         };
         seq = seq.wrapping_add(1);
@@ -209,34 +243,77 @@ async fn target_loop(
     }
 }
 
-async fn setup_pinger(
-    host: &str,
+async fn setup_prober(
+    probe: &Probe,
     v4: &Result<Client, String>,
     v6: &Result<Client, String>,
-) -> Result<Pinger, String> {
+) -> Result<Prober, String> {
     // IPv6 link-local addresses carry a zone id: "fe80::...%en0". The address
     // itself doesn't parse with a zone, so split it off and pass it to the
     // Pinger separately via scope_id (otherwise the kernel has no interface
     // to route through and we get "No route to host").
-    let (host_clean, zone) = match host.split_once('%') {
+    let (host_clean, zone) = match probe.host.split_once('%') {
         Some((h, z)) => (h, Some(z)),
-        None => (host, None),
+        None => (probe.host.as_str(), None),
     };
     let addr = resolve(host_clean)?;
-    let client = match addr {
-        IpAddr::V4(_) => v4.as_ref(),
-        IpAddr::V6(_) => v6.as_ref(),
-    };
-    let client = client.map_err(Clone::clone)?;
-    let ident = PingIdentifier(rand::random());
-    let mut pinger = client.pinger(addr, ident).await;
-    pinger.timeout(PING_TIMEOUT);
-    if let Some(zone) = zone {
-        if let Some(idx) = zone_to_index(zone) {
-            pinger.scope_id(idx);
+    match probe.kind {
+        ProbeKind::Icmp => {
+            let client = match addr {
+                IpAddr::V4(_) => v4.as_ref(),
+                IpAddr::V6(_) => v6.as_ref(),
+            };
+            let client = client.map_err(Clone::clone)?;
+            let ident = PingIdentifier(rand::random());
+            let mut pinger = client.pinger(addr, ident).await;
+            pinger.timeout(PING_TIMEOUT);
+            if let Some(zone) = zone {
+                if let Some(idx) = zone_to_index(zone) {
+                    pinger.scope_id(idx);
+                }
+            }
+            Ok(Prober::Icmp(pinger))
+        }
+        ProbeKind::Tcp => Ok(Prober::Tcp(addr)),
+    }
+}
+
+/// TCP-based reachability probe used for the local router, which often
+/// drops ICMP echo addressed to its own interface even while happily
+/// forwarding everything else. Races a SYN to each port in
+/// `TCP_PROBE_PORTS`; the first one to either accept the connection
+/// (open) or reply RST (closed) wins — both prove the host is reachable.
+/// If every port silently times out within `TCP_PROBE_TIMEOUT`, returns
+/// `Timeout`.
+async fn tcp_probe(addr: IpAddr) -> PingResult {
+    let mut probes: FuturesUnordered<_> = TCP_PROBE_PORTS
+        .iter()
+        .map(|&port| {
+            let sock = SocketAddr::new(addr, port);
+            async move {
+                let start = Instant::now();
+                let res = tokio::time::timeout(
+                    TCP_PROBE_TIMEOUT,
+                    tokio::net::TcpStream::connect(sock),
+                )
+                .await;
+                match res {
+                    Ok(Ok(_)) => Some(start.elapsed()),
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        Some(start.elapsed())
+                    }
+                    _ => None,
+                }
+            }
+        })
+        .collect();
+
+    while let Some(opt) = probes.next().await {
+        if let Some(dur) = opt {
+            return PingResult::Ok(dur.as_secs_f64() * 1000.0);
         }
     }
-    Ok(pinger)
+    PingResult::Timeout
 }
 
 fn zone_to_index(name: &str) -> Option<u32> {
@@ -286,7 +363,7 @@ mod tests {
     #[test]
     fn pings_loopback() {
         let svc = PingService::new(Duration::from_millis(100));
-        svc.set_targets(&["127.0.0.1".to_string()]);
+        svc.set_targets(&[Probe { host: "127.0.0.1".to_string(), kind: ProbeKind::Icmp }]);
         // Give the loop time to complete at least one ping.
         std::thread::sleep(Duration::from_secs(1));
         let snap = svc.snapshot();
@@ -301,14 +378,17 @@ mod tests {
     #[test]
     fn set_targets_reuses_unchanged_slots() {
         let svc = PingService::new(Duration::from_millis(100));
-        svc.set_targets(&["127.0.0.1".to_string()]);
+        svc.set_targets(&[Probe { host: "127.0.0.1".to_string(), kind: ProbeKind::Icmp }]);
         std::thread::sleep(Duration::from_millis(500));
         let first = svc.snapshot();
         assert!(matches!(first[0].current, PingResult::Ok(_)));
         let first_sample_count = first[0].samples.len();
         assert!(first_sample_count > 0);
 
-        svc.set_targets(&["127.0.0.1".to_string(), "1.1.1.1".to_string()]);
+        svc.set_targets(&[
+            Probe { host: "127.0.0.1".to_string(), kind: ProbeKind::Icmp },
+            Probe { host: "1.1.1.1".to_string(), kind: ProbeKind::Icmp },
+        ]);
         let immediate = svc.snapshot();
         assert!(
             matches!(immediate[0].current, PingResult::Ok(_)),

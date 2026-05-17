@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::ping::{PingResult, Sample};
@@ -5,10 +6,36 @@ use crate::ping::{PingResult, Sample};
 pub const BUCKET_COUNT: usize = 10;
 pub const BUCKET_SIZE: Duration = Duration::from_secs(30);
 
-/// Latency at and below which a bucket is fully "green".
-const GOOD_MS: f64 = 30.0;
-/// Latency at and above which the latency contribution to badness saturates at 1.
-const BAD_MS: f64 = 250.0;
+/// Default latency thresholds. `GOOD_MS` — at or below: fully "green".
+/// `BAD_MS` — at or above: latency badness saturates at 1.
+const GOOD_MS_DEFAULT: f64 = 30.0;
+/// `BAD_MS` is scaled with `GOOD_MS` so the green→yellow→red shape stays
+/// proportional when the user moves the tolerance slider.
+const BAD_TO_GOOD_RATIO: f64 = 250.0 / 30.0;
+
+/// Runtime "good" latency threshold (bit-packed f64). 0 == unset → default.
+static GOOD_MS_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Set the "good" latency threshold in milliseconds. The "bad" threshold
+/// scales proportionally.
+pub fn set_tolerance_ms(good_ms: f64) {
+    let v = if good_ms.is_finite() && good_ms > 0.0 {
+        good_ms
+    } else {
+        GOOD_MS_DEFAULT
+    };
+    GOOD_MS_BITS.store(v.to_bits(), Ordering::Relaxed);
+}
+
+fn thresholds() -> (f64, f64) {
+    let bits = GOOD_MS_BITS.load(Ordering::Relaxed);
+    let good = if bits == 0 {
+        GOOD_MS_DEFAULT
+    } else {
+        f64::from_bits(bits)
+    };
+    (good, good * BAD_TO_GOOD_RATIO)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct BucketInfo {
@@ -77,8 +104,9 @@ pub fn badness(b: &BucketInfo) -> Option<f64> {
     if b.samples == 0 {
         return None;
     }
+    let (good, bad) = thresholds();
     let latency = match b.max_ok_ms {
-        Some(ms) => smoothstep(GOOD_MS, BAD_MS, ms),
+        Some(ms) => smoothstep(good, bad, ms),
         None => 1.0,
     };
     let loss = b.loss_rate();

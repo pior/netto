@@ -18,9 +18,9 @@ use objc2::AnyThread;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBezierPath, NSButton,
     NSColor, NSFont, NSFontAttributeName, NSFontWeightRegular, NSForegroundColorAttributeName,
-    NSImage, NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSStatusBar, NSStatusItem, NSTextAlignment,
-    NSTextField, NSToolTipTag, NSView, NSVariableStatusItemLength,
+    NSAttributedStringNSStringDrawing, NSImage, NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSLineBreakMode, NSMenu,
+    NSMenuDelegate, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSStatusBar, NSStatusItem,
+    NSTextAlignment, NSTextField, NSToolTipTag, NSVariableStatusItemLength, NSView,
 };
 use objc2_foundation::{NSAttributedString, NSDictionary};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -31,12 +31,9 @@ use objc2_foundation::{
 };
 
 use netinfo::NetInfo;
-use ping::{HostSnapshot, PingResult, PingService, PingTarget};
+use ping::{HostSnapshot, PingResult, PingService, PingTarget, Probe, ProbeKind};
 
 const DEFAULT_TARGETS: &[&str] = &["google.com", "cloudflare.com", "apple.com"];
-
-const SLOW_INTERVAL: Duration = Duration::from_secs(10);
-const FAST_INTERVAL: Duration = Duration::from_secs(1);
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -52,7 +49,8 @@ define_class!(
             let mtm = MainThreadMarker::from(self);
             self.install_menu_delegate();
             self.tick(mtm);
-            self.reschedule_timer(mtm, SLOW_INTERVAL);
+            let slow = self.ivars().slow_interval.get();
+            self.reschedule_timer(mtm, slow);
         }
     }
 
@@ -66,16 +64,18 @@ define_class!(
             // rebuild_menu_structure is skipped.
             self.tick(mtm);
             self.ivars().menu_open.set(true);
-            self.ivars().ping_service.set_interval(FAST_INTERVAL);
-            self.reschedule_timer(mtm, FAST_INTERVAL);
+            let fast = self.ivars().fast_interval.get();
+            self.ivars().ping_service.set_interval(fast);
+            self.reschedule_timer(mtm, fast);
         }
 
         #[unsafe(method(menuDidClose:))]
         fn menu_did_close(&self, _menu: &NSMenu) {
             let mtm = MainThreadMarker::from(self);
             self.ivars().menu_open.set(false);
-            self.ivars().ping_service.set_interval(SLOW_INTERVAL);
-            self.reschedule_timer(mtm, SLOW_INTERVAL);
+            let slow = self.ivars().slow_interval.get();
+            self.ivars().ping_service.set_interval(slow);
+            self.reschedule_timer(mtm, slow);
         }
     }
 
@@ -106,21 +106,24 @@ define_class!(
         }
 
         /// Action target for IP chips — copies the sender's plain title
-        /// (the IP address) into the general pasteboard.
+        /// (the IP address) into the general pasteboard and triggers a
+        /// brief visual flash on the chip.
         #[unsafe(method(copyIp:))]
-        unsafe fn copy_ip(&self, sender: &NSButton) {
+        unsafe fn copy_ip(&self, sender: &ChipButton) {
             let title = sender.title();
             let pasteboard = NSPasteboard::generalPasteboard();
             pasteboard.clearContents();
             unsafe { pasteboard.setString_forType(&title, NSPasteboardTypeString) };
+            sender.flash_copied();
         }
 
-        #[unsafe(method(reloadTargets:))]
-        unsafe fn reload_targets(&self, _sender: &AnyObject) {
+        #[unsafe(method(reloadSettings:))]
+        unsafe fn reload_settings(&self, _sender: &AnyObject) {
             let mtm = MainThreadMarker::from(self);
             if let Some(targets) = settings::load_targets() {
                 *self.ivars().targets.borrow_mut() = targets;
             }
+            self.apply_prefs();
             self.tick(mtm);
         }
     }
@@ -135,12 +138,14 @@ struct AppDelegateIvars {
     internet_row: InfoRow,
     router_row: InfoRow,
     target_rows: RefCell<Vec<InfoRow>>,
-    dns_rows: RefCell<Vec<InfoRow>>,
+    dns_rows: RefCell<Vec<DnsRow>>,
     vpn_row: InfoRow,
     ip_rows: RefCell<Vec<NetInfoRow>>,
     settings_item: Retained<NSMenuItem>,
     quit_item: Retained<NSMenuItem>,
     menu_open: Cell<bool>,
+    slow_interval: Cell<Duration>,
+    fast_interval: Cell<Duration>,
     refresh_timer: RefCell<Option<Retained<NSTimer>>>,
     prefs_controller: RefCell<Option<Retained<NSObject>>>,
     public_v4: Arc<Mutex<Option<String>>>,
@@ -177,10 +182,15 @@ impl AppDelegate {
         let quit_item = create_menu_item(mtm, ns_string!("Quit"), Some(sel!(terminate:)));
         quit_item.setKeyEquivalent(ns_string!("q"));
 
+        let prefs = settings::load_prefs();
+        sparkline::set_tolerance_ms(prefs.tolerance_ms);
+        let slow = Duration::from_secs_f64(prefs.slow_secs);
+        let fast = Duration::from_secs_f64(prefs.fast_secs);
+
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars {
             status_item,
             targets: RefCell::new(targets),
-            ping_service: PingService::new(SLOW_INTERVAL),
+            ping_service: PingService::new(slow),
             net_info: RefCell::new(NetInfo::default()),
             menu,
             internet_row,
@@ -192,6 +202,8 @@ impl AppDelegate {
             settings_item,
             quit_item,
             menu_open: Cell::new(false),
+            slow_interval: Cell::new(slow),
+            fast_interval: Cell::new(fast),
             refresh_timer: RefCell::new(None),
             prefs_controller: RefCell::new(None),
             public_v4: Arc::new(Mutex::new(None)),
@@ -234,7 +246,7 @@ impl AppDelegate {
         let structure_changed = ivars.ip_rows.borrow().len() != new_ip_row_count
             || ivars.dns_rows.borrow().len() != new_info.dns_ips.len().max(1)
             || ivars.target_rows.borrow().len() != ivars.targets.borrow().len()
-            || prev_info.router_v4.is_some() != new_info.router_v4.is_some()
+            || pick_router_probe(&prev_info).is_some() != pick_router_probe(&new_info).is_some()
             || prev_info.vpn_interface.is_some() != new_info.vpn_interface.is_some();
 
         *ivars.net_info.borrow_mut() = new_info.clone();
@@ -259,14 +271,21 @@ impl AppDelegate {
         )
     }
 
-    fn host_list(&self, info: &NetInfo) -> Vec<String> {
+    fn host_list(&self, info: &NetInfo) -> Vec<Probe> {
         let targets = self.ivars().targets.borrow();
-        let mut hosts: Vec<String> = targets.iter().map(|t| t.host.clone()).collect();
-        if let Some(ip) = &info.router_v4 {
-            hosts.push(ip.clone());
+        let mut probes: Vec<Probe> = targets
+            .iter()
+            .map(|t| Probe { host: t.host.clone(), kind: ProbeKind::Icmp })
+            .collect();
+        if let Some(p) = pick_router_probe(info) {
+            probes.push(p);
         }
-        hosts.extend(info.dns_ips.iter().cloned());
-        hosts
+        probes.extend(
+            info.dns_ips
+                .iter()
+                .map(|ip| Probe { host: ip.clone(), kind: ProbeKind::Icmp }),
+        );
+        probes
     }
 
     fn rebuild_menu_structure(&self, mtm: MainThreadMarker, info: &NetInfo) {
@@ -292,11 +311,11 @@ impl AppDelegate {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // DNS rows (with sparkline + latency).
+        // DNS rows (label + IP chip + sparkline + latency).
         {
             let mut rows = ivars.dns_rows.borrow_mut();
             let row_count = info.dns_ips.len().max(1);
-            rows.resize_with(row_count, || InfoRow::new(mtm));
+            rows.resize_with(row_count, || DnsRow::new(mtm, self as &AnyObject));
             for row in rows.iter() {
                 menu.addItem(&row.item);
             }
@@ -335,7 +354,7 @@ impl AppDelegate {
         let target_count = targets.len();
         let target_snaps: &[HostSnapshot] = snapshot.get(..target_count).unwrap_or(&[]);
         let mut idx = target_count;
-        let router_snap: Option<&HostSnapshot> = if info.router_v4.is_some() {
+        let router_snap: Option<&HostSnapshot> = if pick_router_probe(info).is_some() {
             let r = snapshot.get(idx);
             idx += 1;
             r
@@ -394,12 +413,12 @@ impl AppDelegate {
             }
         }
 
-        // DNS rows: sparkline + latency. Strip IPv6 zone-id suffix for display
-        // (e.g. "fe80::...%en0" → "fe80::...").
+        // DNS rows: label + chip + sparkline + latency. Strip IPv6 zone-id
+        // suffix for display (e.g. "fe80::...%en0" → "fe80::...").
         let dns_rows = ivars.dns_rows.borrow();
         if info.dns_ips.is_empty() {
             if let Some(row) = dns_rows.first() {
-                row.set("DNS: unknown", vec![], "");
+                row.set(None, vec![], "");
             }
         } else {
             for (i, ip) in info.dns_ips.iter().enumerate() {
@@ -409,7 +428,7 @@ impl AppDelegate {
                         Some(s) => (s.current.clone(), sparkline::bucketize(&s.samples, now)),
                         None => (PingResult::Pending, vec![]),
                     };
-                    row.set(&format!("DNS {display_ip}"), buckets, &format_result(&current));
+                    row.set(Some(display_ip), buckets, &format_result(&current));
                 }
             }
         }
@@ -449,7 +468,7 @@ impl AppDelegate {
         let on_save = Box::new(move || {
             let obj = app_delegate_ptr as *const AnyObject;
             unsafe {
-                let _: () = msg_send![obj, reloadTargets: std::ptr::null::<AnyObject>()];
+                let _: () = msg_send![obj, reloadSettings: std::ptr::null::<AnyObject>()];
             }
         });
 
@@ -460,6 +479,24 @@ impl AppDelegate {
 
         controller.show();
         *ivars.prefs_controller.borrow_mut() = Some(Retained::into_super(controller));
+    }
+
+    /// Reload tunable preferences (intervals + sparkline sensitivity) from
+    /// NSUserDefaults and immediately apply them: update the live intervals,
+    /// retarget the ping service, and reschedule the UI tick timer at the
+    /// rate matching the menu's current state.
+    fn apply_prefs(&self) {
+        let prefs = settings::load_prefs();
+        let ivars = self.ivars();
+        let slow = Duration::from_secs_f64(prefs.slow_secs);
+        let fast = Duration::from_secs_f64(prefs.fast_secs);
+        ivars.slow_interval.set(slow);
+        ivars.fast_interval.set(fast);
+        sparkline::set_tolerance_ms(prefs.tolerance_ms);
+        let mtm = MainThreadMarker::from(self);
+        let current = if ivars.menu_open.get() { fast } else { slow };
+        ivars.ping_service.set_interval(current);
+        self.reschedule_timer(mtm, current);
     }
 
     fn reschedule_timer(&self, _mtm: MainThreadMarker, interval: Duration) {
@@ -494,6 +531,42 @@ struct IpEntry {
 /// The set of IP-chip rows to display, in order. Each entry shows a label
 /// plus one or two clickable address chips; entries with neither v4 nor v6
 /// are omitted.
+/// Drop an IPv6 zone-id suffix ("%en0") for display purposes.
+fn strip_zone(addr: &str) -> &str {
+    addr.split('%').next().unwrap_or(addr)
+}
+
+/// 192.0.0.0/29 is reserved by RFC 7335 for DNS64/NAT64 use. On IPv6-only
+/// mobile networks with 464XLAT, macOS sets the IPv4 default gateway to
+/// 192.0.0.1 as a CLAT placeholder — no real host lives there, so probing
+/// it (ICMP or TCP) always times out.
+fn is_clat_placeholder(ip: &str) -> bool {
+    match ip.parse::<std::net::Ipv4Addr>() {
+        Ok(a) => {
+            let o = a.octets();
+            o[0] == 192 && o[1] == 0 && o[2] == 0 && o[3] < 8
+        }
+        Err(_) => false,
+    }
+}
+
+/// Pick the best router address to probe:
+/// 1. IPv6 router (ICMPv6 — link-local with zone id works directly, and
+///    IPv6 routers generally answer echo since ND requires it).
+/// 2. IPv4 router via TCP fallback — but skip the CLAT placeholder block,
+///    which has no real host to talk to.
+fn pick_router_probe(info: &NetInfo) -> Option<Probe> {
+    if let Some(v6) = &info.router_v6 {
+        return Some(Probe { host: v6.clone(), kind: ProbeKind::Icmp });
+    }
+    if let Some(v4) = &info.router_v4 {
+        if !is_clat_placeholder(v4) {
+            return Some(Probe { host: v4.clone(), kind: ProbeKind::Tcp });
+        }
+    }
+    None
+}
+
 fn ip_entries(
     info: &NetInfo,
     public: &(Option<String>, Option<String>),
@@ -510,7 +583,9 @@ fn ip_entries(
         rows.push(IpEntry {
             label: "Router",
             v4: info.router_v4.clone(),
-            v6: info.router_v6.clone(),
+            // router_v6 may carry a "%zone" suffix (needed for ICMPv6 to
+            // link-local) — strip it for chip display.
+            v6: info.router_v6.as_deref().map(strip_zone).map(str::to_string),
         });
     }
     if public.0.is_some() || public.1.is_some() {
@@ -584,10 +659,10 @@ fn aggregate_best(snaps: &[HostSnapshot]) -> PingResult {
 }
 
 const SPARK_CELL_W: f64 = 5.0;
-const SPARK_GAP: f64 = 2.0;
+const SPARK_GAP: f64 = 1.0;
 const SPARK_HEIGHT: f64 = 11.0;
 const SPARK_RADIUS: f64 = 1.5;
-const LATENCY_WIDTH: f64 = 70.0;
+const LATENCY_WIDTH: f64 = 52.0;
 
 fn spark_total_width() -> f64 {
     let n = sparkline::BUCKET_COUNT as f64;
@@ -685,6 +760,96 @@ impl SparklineView {
             );
             path.fill();
         }
+    }
+}
+
+/// NSButton subclass for the IP chips. Draws a subtle rounded-rect background
+/// sized to the attributed title (so the chip's frame can stay a fixed width
+/// for column alignment while the visible "pill" hugs the text). When the
+/// user clicks the chip, `flash_copied` briefly swaps the background to a
+/// green tint as a "copied" cue.
+const CHIP_RADIUS: f64 = 4.0;
+const CHIP_BG_VPAD: f64 = 2.0;
+const CHIP_FLASH_SECS: f64 = 0.7;
+
+define_class!(
+    #[unsafe(super(NSButton))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ChipButtonIvars]
+    struct ChipButton;
+
+    impl ChipButton {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, dirty: CGRect) {
+            self.draw_bg();
+            unsafe {
+                let _: () = msg_send![super(self), drawRect: dirty];
+            }
+        }
+
+        #[unsafe(method(flashCopied))]
+        fn flash_copied_objc(&self) {
+            self.flash_copied();
+        }
+
+        #[unsafe(method(endFlash:))]
+        unsafe fn end_flash(&self, _timer: &NSTimer) {
+            self.ivars().flashing.set(false);
+            unsafe { let _: () = msg_send![self, setNeedsDisplay: true]; }
+        }
+    }
+);
+
+struct ChipButtonIvars {
+    flashing: Cell<bool>,
+}
+
+impl ChipButton {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ChipButtonIvars {
+            flashing: Cell::new(false),
+        });
+        let btn: Retained<Self> = unsafe { msg_send![super(this), init] };
+        btn
+    }
+
+    fn flash_copied(&self) {
+        self.ivars().flashing.set(true);
+        unsafe { let _: () = msg_send![self, setNeedsDisplay: true]; }
+        // Use timerWithTimeInterval + addTimer:forMode: so the revert fires
+        // while the menu is open (NSEventTrackingRunLoopMode).
+        unsafe {
+            let timer = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                CHIP_FLASH_SECS,
+                self as &AnyObject,
+                sel!(endFlash:),
+                None,
+                false,
+            );
+            NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes);
+        }
+    }
+
+    fn draw_bg(&self) {
+        let attr = self.attributedTitle();
+        let text_size = attr.size();
+        if text_size.width <= 0.0 {
+            return;
+        }
+        let bounds = self.bounds();
+        let bg_h = (text_size.height + 2.0 * CHIP_BG_VPAD).min(bounds.size.height);
+        let bg_w = text_size.width.min(bounds.size.width);
+        let y = (bounds.size.height - bg_h) / 2.0;
+        let bg_rect = CGRect::new(CGPoint::new(0.0, y), CGSize::new(bg_w, bg_h));
+        let (base, alpha) = if self.ivars().flashing.get() {
+            (NSColor::systemGreenColor(), 0.30)
+        } else {
+            (NSColor::labelColor(), 0.08)
+        };
+        let bg = base.colorWithAlphaComponent(alpha);
+        bg.setFill();
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bg_rect, CHIP_RADIUS, CHIP_RADIUS)
+            .fill();
     }
 }
 
@@ -804,6 +969,12 @@ impl InfoRow {
         left.setFont(Some(&font));
         right.setFont(Some(&font));
         right.setAlignment(NSTextAlignment::Right);
+        // Single line + tail truncation. With attributed strings of mixed
+        // font sizes (e.g. DNS row: "DNS " + smaller monospaced IPv6), this
+        // ensures the field can shrink horizontally to fit the available
+        // space instead of clipping the IP entirely.
+        left.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        left.setMaximumNumberOfLines(1);
         left.setTranslatesAutoresizingMaskIntoConstraints(false);
         right.setTranslatesAutoresizingMaskIntoConstraints(false);
 
@@ -815,7 +986,7 @@ impl InfoRow {
 
         const H_MARGIN: f64 = 14.0;
         const V_MARGIN: f64 = 3.0;
-        const SPACING: f64 = 10.0;
+        const SPACING: f64 = 6.0;
 
         let left_obj: &AnyObject = &left;
         let spark_obj: &AnyObject = &sparkline;
@@ -866,6 +1037,110 @@ impl InfoRow {
     }
 }
 
+/// DNS row: "DNS" label + click-to-copy IP chip + sparkline + latency.
+/// Same right-side column layout as `InfoRow` so sparklines and latencies
+/// align across all rows.
+struct DnsRow {
+    item: Retained<NSMenuItem>,
+    label: Retained<NSTextField>,
+    chip: Retained<ChipButton>,
+    sparkline: Retained<SparklineView>,
+    right: Retained<NSTextField>,
+}
+
+impl DnsRow {
+    fn new(mtm: MainThreadMarker, copy_target: &AnyObject) -> Self {
+        let item = NSMenuItem::new(mtm);
+        item.setEnabled(true);
+
+        let view = NSView::new(mtm);
+        view.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let label = NSTextField::labelWithString(ns_string!(""), mtm);
+        let right = NSTextField::labelWithString(ns_string!(""), mtm);
+        let font = NSFont::menuFontOfSize(0.0);
+        label.setFont(Some(&font));
+        right.setFont(Some(&font));
+        right.setAlignment(NSTextAlignment::Right);
+        label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        label.setMaximumNumberOfLines(1);
+        label.setTranslatesAutoresizingMaskIntoConstraints(false);
+        right.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+        let chip = make_chip(mtm, copy_target);
+        let sparkline = SparklineView::new(mtm);
+
+        view.addSubview(&label);
+        view.addSubview(&chip);
+        view.addSubview(&sparkline);
+        view.addSubview(&right);
+
+        const H_MARGIN: f64 = 14.0;
+        const V_MARGIN: f64 = 3.0;
+        const SPACING: f64 = 6.0;
+        const LABEL_CHIP_GAP: f64 = 2.0;
+
+        let label_obj: &AnyObject = &label;
+        let chip_obj: &AnyObject = &chip;
+        let spark_obj: &AnyObject = &sparkline;
+        let right_obj: &AnyObject = &right;
+        let view_obj: &AnyObject = &view;
+        unsafe {
+            for c in [
+                pin(label_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(chip_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(spark_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(right_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
+                pin(label_obj, NSLayoutAttribute::Top, view_obj, NSLayoutAttribute::Top, V_MARGIN),
+                pin(view_obj, NSLayoutAttribute::Bottom, label_obj, NSLayoutAttribute::Bottom, V_MARGIN),
+
+                // Right column: fixed-width latency pinned to view trailing.
+                pin(right_obj, NSLayoutAttribute::Trailing, view_obj, NSLayoutAttribute::Trailing, -H_MARGIN),
+                pin_const(right_obj, NSLayoutAttribute::Width, LATENCY_WIDTH),
+
+                // Sparkline: fixed width, pinned immediately left of the right column.
+                pin(spark_obj, NSLayoutAttribute::Trailing, right_obj, NSLayoutAttribute::Leading, -SPACING),
+                pin_const(spark_obj, NSLayoutAttribute::Width, spark_total_width()),
+                pin_const(spark_obj, NSLayoutAttribute::Height, SPARK_HEIGHT),
+
+                // Label + chip on the left; chip may shrink up to the sparkline.
+                pin(label_obj, NSLayoutAttribute::Leading, view_obj, NSLayoutAttribute::Leading, H_MARGIN),
+                pin(chip_obj, NSLayoutAttribute::Leading, label_obj, NSLayoutAttribute::Trailing, LABEL_CHIP_GAP),
+                pin_rel(
+                    chip_obj,
+                    NSLayoutAttribute::Trailing,
+                    NSLayoutRelation::LessThanOrEqual,
+                    spark_obj,
+                    NSLayoutAttribute::Leading,
+                    -SPACING,
+                ),
+            ] {
+                c.setActive(true);
+            }
+        }
+
+        item.setView(Some(&view));
+        DnsRow { item, label, chip, sparkline, right }
+    }
+
+    /// `ip: None` renders "DNS: unknown" without a chip; `Some(ip)` shows
+    /// "DNS" + a click-to-copy chip.
+    fn set(&self, ip: Option<&str>, buckets: Vec<sparkline::BucketInfo>, right: &str) {
+        match ip {
+            Some(s) => {
+                self.label.setStringValue(ns_string!("DNS"));
+                set_chip(&self.chip, ip_kind(s), Some(s));
+            }
+            None => {
+                self.label.setStringValue(ns_string!("DNS: unknown"));
+                set_chip(&self.chip, ChipKind::V4, None);
+            }
+        }
+        self.right.setStringValue(&NSString::from_str(right));
+        self.sparkline.set_buckets(buckets);
+    }
+}
+
 /// Network-info row that displays the label plus one or two clickable IP
 /// "chips" (v4 + v6). Each chip is a click-to-copy button — title is the
 /// plain IP, the visual styling (font + color) is set through an attributed
@@ -874,8 +1149,8 @@ impl InfoRow {
 struct NetInfoRow {
     item: Retained<NSMenuItem>,
     label: Retained<NSTextField>,
-    v4: Retained<NSButton>,
-    v6: Retained<NSButton>,
+    v4: Retained<ChipButton>,
+    v6: Retained<ChipButton>,
 }
 
 #[derive(Clone, Copy)]
@@ -906,6 +1181,15 @@ impl NetInfoRow {
         const H_MARGIN: f64 = 14.0;
         const V_MARGIN: f64 = 3.0;
         const SPACING: f64 = 8.0;
+        // Fixed label column width so the v4 chip starts at the same x
+        // across all IP rows (Local / Router / Public), independent of the
+        // label text or the v6 chip width.
+        const LABEL_WIDTH: f64 = 56.0;
+        // Fixed v4 chip width so the v6 chip starts at the same x across
+        // rows, independent of the v4 address length.
+        // Wide enough to hold "255.255.255.255" rendered with the chip's
+        // leading/trailing space padding at 12pt monospace.
+        const V4_WIDTH: f64 = 132.0;
 
         let label_obj: &AnyObject = &label;
         let v4_obj: &AnyObject = &v4;
@@ -914,10 +1198,12 @@ impl NetInfoRow {
         unsafe {
             for c in [
                 pin(label_obj, NSLayoutAttribute::Leading, view_obj, NSLayoutAttribute::Leading, H_MARGIN),
+                pin_const(label_obj, NSLayoutAttribute::Width, LABEL_WIDTH),
                 pin(label_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
                 pin(label_obj, NSLayoutAttribute::Top, view_obj, NSLayoutAttribute::Top, V_MARGIN),
                 pin(view_obj, NSLayoutAttribute::Bottom, label_obj, NSLayoutAttribute::Bottom, V_MARGIN),
                 pin(v4_obj, NSLayoutAttribute::Leading, label_obj, NSLayoutAttribute::Trailing, SPACING),
+                pin_const(v4_obj, NSLayoutAttribute::Width, V4_WIDTH),
                 pin(v4_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
                 pin(v6_obj, NSLayoutAttribute::Leading, v4_obj, NSLayoutAttribute::Trailing, SPACING),
                 pin(v6_obj, NSLayoutAttribute::CenterY, view_obj, NSLayoutAttribute::CenterY, 0.0),
@@ -938,10 +1224,13 @@ impl NetInfoRow {
     }
 }
 
-fn make_chip(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSButton> {
-    let btn = NSButton::new(mtm);
+fn make_chip(mtm: MainThreadMarker, target: &AnyObject) -> Retained<ChipButton> {
+    let btn = ChipButton::new(mtm);
     btn.setBordered(false);
     btn.setTitle(ns_string!(""));
+    // Left-align the title so the IP addresses line up at the leading edge
+    // of the fixed-width chip column instead of being centered.
+    btn.setAlignment(NSTextAlignment::Left);
     btn.setTranslatesAutoresizingMaskIntoConstraints(false);
     unsafe {
         btn.setTarget(Some(target));
@@ -953,32 +1242,48 @@ fn make_chip(mtm: MainThreadMarker, target: &AnyObject) -> Retained<NSButton> {
     btn
 }
 
-fn set_chip(btn: &NSButton, kind: ChipKind, ip: Option<&str>) {
+fn set_chip(btn: &ChipButton, kind: ChipKind, ip: Option<&str>) {
     match ip {
         Some(s) if !s.is_empty() => {
             btn.setHidden(false);
             // Plain title (used as the pasteboard payload on click).
             btn.setTitle(&NSString::from_str(s));
             // Attributed title is just for display (font + color); the
-            // button still reports its plain `title` for copy.
-            let attr = chip_attributed_title(kind, s);
+            // button still reports its plain `title` for copy. Pad the
+            // display with spaces so the chip's rounded background has
+            // natural horizontal padding around the IP text.
+            let padded = format!(" {s} ");
+            let attr = chip_attributed_title(kind, &padded);
             btn.setAttributedTitle(&attr);
         }
         _ => btn.setHidden(true),
     }
 }
 
+fn ip_kind(ip: &str) -> ChipKind {
+    if ip.contains(':') {
+        ChipKind::V6
+    } else {
+        ChipKind::V4
+    }
+}
+
+fn ip_color(_kind: ChipKind) -> Retained<NSColor> {
+    // Same darker blue for both v4 and v6.
+    NSColor::colorWithSRGBRed_green_blue_alpha(0.10, 0.35, 0.75, 1.0)
+}
+
 fn chip_attributed_title(kind: ChipKind, ip: &str) -> Retained<NSAttributedString> {
     let (font, color) = match kind {
         ChipKind::V4 => (
             NSFont::monospacedSystemFontOfSize_weight(12.0, unsafe { NSFontWeightRegular }),
-            NSColor::systemBlueColor(),
+            ip_color(kind),
         ),
         ChipKind::V6 => (
             // Smaller monospaced font for v6 — IPv6 addresses are long and
             // we want them to take less horizontal space than v4.
-            NSFont::monospacedSystemFontOfSize_weight(10.0, unsafe { NSFontWeightRegular }),
-            NSColor::systemIndigoColor(),
+            NSFont::monospacedSystemFontOfSize_weight(12.0, unsafe { NSFontWeightRegular }),
+            ip_color(kind),
         ),
     };
     let key_color: &NSString = unsafe { NSForegroundColorAttributeName };
@@ -1049,7 +1354,7 @@ unsafe fn pin_const(
 
 fn format_result(result: &PingResult) -> String {
     match result {
-        PingResult::Ok(ms) => format!("{ms:.1}ms"),
+        PingResult::Ok(ms) => format!("{:.0}ms", ms.round()),
         PingResult::Timeout => "timeout".to_string(),
         PingResult::Error(e) => e.clone(),
         PingResult::Pending => "...".to_string(),

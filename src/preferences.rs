@@ -7,9 +7,9 @@ use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOn
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSButtonType, NSColor, NSFont, NSLayoutAttribute,
-    NSLayoutRelation, NSStackView, NSStackViewDistribution, NSTextField, NSTextFieldBezelStyle,
-    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
-    NSWorkspace,
+    NSLayoutRelation, NSSlider, NSStackView, NSStackViewDistribution, NSTextAlignment,
+    NSTextField, NSTextFieldBezelStyle, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_app_kit::{NSControlStateValueOff, NSControlStateValueOn};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -23,7 +23,10 @@ const ROW_SUBVIEW_COUNT: usize = 2;
 const MAX_ENTRY_ROWS: usize = 15;
 const PREF_WINDOW_WIDTH: f64 = 480.0;
 const CONTENT_PADDING: f64 = 16.0;
-const SECTION_GAP: f64 = 10.0;
+const SECTION_GAP: f64 = 22.0;
+const SLIDER_ROW_SPACING: f64 = 14.0;
+const SLIDER_WIDTH: f64 = 260.0;
+const TICKS_TOP_GAP: f64 = 2.0;
 const GITHUB_URL: &str = "https://github.com/pior/netto";
 
 define_class!(
@@ -52,6 +55,11 @@ define_class!(
         #[unsafe(method(controlTextDidEndEditing:))]
         fn control_text_did_end_editing(&self, _notification: &NSNotification) {
             self.do_save();
+        }
+
+        #[unsafe(method(sliderChanged:))]
+        fn slider_changed(&self, _sender: &NSSlider) {
+            self.do_save_prefs();
         }
 
         #[unsafe(method(addEntry:))]
@@ -88,6 +96,9 @@ define_class!(
 pub struct PrefsControllerIvars {
     window: Retained<NSWindow>,
     rows_stack: Retained<NSStackView>,
+    slow_slider: Retained<NSSlider>,
+    fast_slider: Retained<NSSlider>,
+    tolerance_slider: Retained<NSSlider>,
     on_save: Box<dyn Fn()>,
 }
 
@@ -122,9 +133,18 @@ impl PrefsController {
         rows_stack.setAlignment(NSLayoutAttribute::Width);
         rows_stack.setTranslatesAutoresizingMaskIntoConstraints(false);
 
+        let prefs = settings::load_prefs();
+        let slow_slider = make_stepped_slider(mtm, settings::SLOW_STEPS, prefs.slow_secs);
+        let fast_slider = make_stepped_slider(mtm, settings::FAST_STEPS, prefs.fast_secs);
+        let tolerance_slider =
+            make_stepped_slider(mtm, settings::TOLERANCE_STEPS, prefs.tolerance_ms);
+
         let this = Self::alloc(mtm).set_ivars(PrefsControllerIvars {
             window: window.clone(),
             rows_stack: rows_stack.clone(),
+            slow_slider: slow_slider.clone(),
+            fast_slider: fast_slider.clone(),
+            tolerance_slider: tolerance_slider.clone(),
             on_save,
         });
         let controller: Retained<Self> = unsafe { msg_send![super(this), init] };
@@ -139,6 +159,23 @@ impl PrefsController {
             controller.do_add_entry_with(mtm, &target.host);
         }
 
+        // Wire slider actions now that the controller exists.
+        let controller_obj: &AnyObject = &controller;
+        for s in [&slow_slider, &fast_slider, &tolerance_slider] {
+            unsafe {
+                s.setTarget(Some(controller_obj));
+                s.setAction(Some(sel!(sliderChanged:)));
+            }
+        }
+
+        let prefs_section = create_prefs_section(
+            mtm,
+            &slow_slider,
+            &fast_slider,
+            &tolerance_slider,
+        );
+        prefs_section.setTranslatesAutoresizingMaskIntoConstraints(false);
+
         let launch_checkbox = create_launch_at_login_checkbox(mtm, &controller);
         launch_checkbox.setTranslatesAutoresizingMaskIntoConstraints(false);
         let footer = create_footer(mtm, &controller);
@@ -149,6 +186,7 @@ impl PrefsController {
         window.setContentView(Some(&content_view));
 
         content_view.addSubview(&rows_stack);
+        content_view.addSubview(&prefs_section);
         content_view.addSubview(&launch_checkbox);
         content_view.addSubview(&footer);
 
@@ -169,9 +207,21 @@ impl PrefsController {
                 &*launch_checkbox, NSLayoutAttribute::CenterX, NSLayoutRelation::Equal,
                 Some(&*content_view), NSLayoutAttribute::CenterX, 1.0, 0.0,
             );
+            let prefs_leading = objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &*prefs_section, NSLayoutAttribute::Leading, NSLayoutRelation::Equal,
+                Some(&*content_view), NSLayoutAttribute::Leading, 1.0, CONTENT_PADDING,
+            );
+            let prefs_trailing = objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &*prefs_section, NSLayoutAttribute::Trailing, NSLayoutRelation::Equal,
+                Some(&*content_view), NSLayoutAttribute::Trailing, 1.0, -CONTENT_PADDING,
+            );
+            let prefs_top = objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+                &*prefs_section, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
+                Some(&*rows_stack), NSLayoutAttribute::Bottom, 1.0, SECTION_GAP,
+            );
             let cb_top = objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &*launch_checkbox, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
-                Some(&*rows_stack), NSLayoutAttribute::Bottom, 1.0, SECTION_GAP,
+                Some(&*prefs_section), NSLayoutAttribute::Bottom, 1.0, SECTION_GAP,
             );
             let footer_top = objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
                 &*footer, NSLayoutAttribute::Top, NSLayoutRelation::Equal,
@@ -192,6 +242,9 @@ impl PrefsController {
             leading.setActive(true);
             trailing.setActive(true);
             top.setActive(true);
+            prefs_leading.setActive(true);
+            prefs_trailing.setActive(true);
+            prefs_top.setActive(true);
             cb_center.setActive(true);
             cb_top.setActive(true);
             footer_top.setActive(true);
@@ -353,12 +406,33 @@ impl PrefsController {
         add_button.setEnabled(self.entry_count() < MAX_ENTRY_ROWS);
     }
 
+    fn do_save_prefs(&self) {
+        let ivars = self.ivars();
+        // All three sliders are 0..N-1 indices into the step arrays.
+        let slow = step_value(&ivars.slow_slider, settings::SLOW_STEPS, settings::SLOW_DEFAULT);
+        let fast = step_value(&ivars.fast_slider, settings::FAST_STEPS, settings::FAST_DEFAULT);
+        let tolerance_ms = step_value(
+            &ivars.tolerance_slider,
+            settings::TOLERANCE_STEPS,
+            settings::TOLERANCE_DEFAULT,
+        );
+        settings::save_prefs(&settings::AppPrefs {
+            slow_secs: slow,
+            fast_secs: fast,
+            tolerance_ms,
+        });
+        (ivars.on_save)();
+    }
+
     fn do_save(&self) {
         let ivars = self.ivars();
         let mut targets = Vec::new();
 
         let subviews = ivars.rows_stack.arrangedSubviews();
-        for i in 0..subviews.count() {
+        // The last arranged subview is the add-button row (spacer + button),
+        // not an entry row — skip it.
+        let entry_count = subviews.count().saturating_sub(1);
+        for i in 0..entry_count {
             let Ok(row_view) = subviews.objectAtIndex(i).downcast::<NSStackView>() else {
                 continue;
             };
@@ -367,8 +441,12 @@ impl PrefsController {
                 continue;
             }
 
-            let host_field: Retained<NSTextField> =
-                row_subviews.objectAtIndex(IDX_HOST).downcast().unwrap();
+            let Ok(host_field) = row_subviews
+                .objectAtIndex(IDX_HOST)
+                .downcast::<NSTextField>()
+            else {
+                continue;
+            };
 
             let host = host_field.stringValue().to_string();
             if host.is_empty() {
@@ -475,6 +553,207 @@ fn create_launch_at_login_checkbox(
     });
 
     btn
+}
+
+/// Stepped slider: integer index 0..steps.len()-1 with one tick per step,
+/// snapping to ticks only. Initial position is the index of the step
+/// closest to `value` (which is already snapped on `load_prefs`).
+fn make_stepped_slider(
+    mtm: MainThreadMarker,
+    steps: &[f64],
+    value: f64,
+) -> Retained<NSSlider> {
+    let n = steps.len().max(1);
+    let slider = NSSlider::new(mtm);
+    slider.setMinValue(0.0);
+    slider.setMaxValue((n - 1) as f64);
+    slider.setNumberOfTickMarks(n as isize);
+    slider.setAllowsTickMarkValuesOnly(true);
+    let idx = steps
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            (*a - value)
+                .abs()
+                .partial_cmp(&(*b - value).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    slider.setDoubleValue(idx as f64);
+    slider.setContinuous(true);
+    slider.setTranslatesAutoresizingMaskIntoConstraints(false);
+    slider
+}
+
+/// Read the current step value from a stepped slider, falling back to
+/// `default` if the index is somehow out of range.
+fn step_value(slider: &NSSlider, steps: &[f64], default: f64) -> f64 {
+    let idx = slider.doubleValue().round() as isize;
+    if idx < 0 {
+        return *steps.first().unwrap_or(&default);
+    }
+    steps.get(idx as usize).copied().unwrap_or(default)
+}
+
+fn create_prefs_section(
+    mtm: MainThreadMarker,
+    slow_slider: &NSSlider,
+    fast_slider: &NSSlider,
+    tolerance_slider: &NSSlider,
+) -> Retained<NSStackView> {
+    let stack = NSStackView::new(mtm);
+    stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+    stack.setSpacing(SLIDER_ROW_SPACING);
+    stack.setAlignment(NSLayoutAttribute::Width);
+
+    let slow_ticks: Vec<String> = settings::SLOW_STEPS.iter().map(|v| format_secs(*v)).collect();
+    let fast_ticks: Vec<String> = settings::FAST_STEPS.iter().map(|v| format_secs(*v)).collect();
+    let tolerance_ticks: Vec<String> = settings::TOLERANCE_STEPS
+        .iter()
+        .map(|v| format!("{:.0}", v))
+        .collect();
+
+    stack.addArrangedSubview(&slider_row(
+        mtm,
+        "Background refresh",
+        slow_slider,
+        &slow_ticks,
+    ));
+    stack.addArrangedSubview(&slider_row(mtm, "Open refresh", fast_slider, &fast_ticks));
+    stack.addArrangedSubview(&slider_row(
+        mtm,
+        "Latency tolerance (ms)",
+        tolerance_slider,
+        &tolerance_ticks,
+    ));
+    stack
+}
+
+fn format_secs(v: f64) -> String {
+    if (v - v.round()).abs() < 1e-6 {
+        format!("{:.0}s", v.round())
+    } else {
+        format!("{v}s")
+    }
+}
+
+/// One slider row: the title sits at the left edge of the section, the
+/// slider is pinned to the right edge with a fixed width (so all sliders
+/// line up), and the tick-value row sits underneath the slider, sharing
+/// its width and right edge.
+fn slider_row(
+    mtm: MainThreadMarker,
+    title: &str,
+    slider: &NSSlider,
+    tick_labels: &[String],
+) -> Retained<NSView> {
+    let container = NSView::new(mtm);
+    container.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let title_label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    title_label.setFont(Some(&NSFont::systemFontOfSize(NSFont::smallSystemFontSize())));
+    title_label.setAlignment(NSTextAlignment::Left);
+    title_label.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    let ticks_row = make_tick_labels_row(mtm, tick_labels);
+    ticks_row.setTranslatesAutoresizingMaskIntoConstraints(false);
+
+    container.addSubview(&title_label);
+    container.addSubview(slider);
+    container.addSubview(&ticks_row);
+
+    let title_obj: &AnyObject = &title_label;
+    let slider_obj: &AnyObject = slider;
+    let ticks_obj: &AnyObject = &ticks_row;
+    let container_obj: &AnyObject = &container;
+    unsafe {
+        for c in [
+            // Title: left edge of container, vertically centered with slider.
+            pin_two(title_obj, NSLayoutAttribute::Leading, container_obj, NSLayoutAttribute::Leading, 0.0),
+            pin_two(title_obj, NSLayoutAttribute::CenterY, slider_obj, NSLayoutAttribute::CenterY, 0.0),
+            // Title may not overrun the slider column.
+            pin_two_rel(title_obj, NSLayoutAttribute::Trailing, NSLayoutRelation::LessThanOrEqual,
+                slider_obj, NSLayoutAttribute::Leading, -8.0),
+            // Slider: right edge, fixed width, at the top of the container.
+            pin_two(slider_obj, NSLayoutAttribute::Trailing, container_obj, NSLayoutAttribute::Trailing, 0.0),
+            pin_const(slider_obj, NSLayoutAttribute::Width, SLIDER_WIDTH),
+            pin_two(slider_obj, NSLayoutAttribute::Top, container_obj, NSLayoutAttribute::Top, 0.0),
+            // Ticks: same right edge and width as the slider, just below it.
+            pin_two(ticks_obj, NSLayoutAttribute::Trailing, container_obj, NSLayoutAttribute::Trailing, 0.0),
+            pin_const(ticks_obj, NSLayoutAttribute::Width, SLIDER_WIDTH),
+            pin_two(ticks_obj, NSLayoutAttribute::Top, slider_obj, NSLayoutAttribute::Bottom, TICKS_TOP_GAP),
+            // Container hugs the ticks row's bottom edge.
+            pin_two(container_obj, NSLayoutAttribute::Bottom, ticks_obj, NSLayoutAttribute::Bottom, 0.0),
+        ] {
+            c.setActive(true);
+        }
+    }
+
+    container
+}
+
+unsafe fn pin_two(
+    a: &AnyObject,
+    aa: NSLayoutAttribute,
+    b: &AnyObject,
+    ba: NSLayoutAttribute,
+    constant: f64,
+) -> Retained<objc2_app_kit::NSLayoutConstraint> {
+    unsafe { pin_two_rel(a, aa, NSLayoutRelation::Equal, b, ba, constant) }
+}
+
+unsafe fn pin_two_rel(
+    a: &AnyObject,
+    aa: NSLayoutAttribute,
+    rel: NSLayoutRelation,
+    b: &AnyObject,
+    ba: NSLayoutAttribute,
+    constant: f64,
+) -> Retained<objc2_app_kit::NSLayoutConstraint> {
+    unsafe {
+        objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            a, aa, rel, Some(b), ba, 1.0, constant,
+        )
+    }
+}
+
+unsafe fn pin_const(
+    a: &AnyObject,
+    attr: NSLayoutAttribute,
+    constant: f64,
+) -> Retained<objc2_app_kit::NSLayoutConstraint> {
+    unsafe {
+        objc2_app_kit::NSLayoutConstraint::constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant(
+            a,
+            attr,
+            NSLayoutRelation::Equal,
+            None,
+            NSLayoutAttribute::NotAnAttribute,
+            1.0,
+            constant,
+        )
+    }
+}
+
+/// Horizontal stack of small tick-value labels. Uses `EqualCentering` so
+/// labels' centers are evenly distributed across the row's width — close
+/// to (though not pixel-perfect with) NSSlider's tick mark positions.
+fn make_tick_labels_row(mtm: MainThreadMarker, labels: &[String]) -> Retained<NSStackView> {
+    let row = NSStackView::new(mtm);
+    row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+    row.setDistribution(NSStackViewDistribution::EqualCentering);
+    row.setAlignment(NSLayoutAttribute::CenterY);
+    let font = NSFont::systemFontOfSize(NSFont::smallSystemFontSize() - 1.0);
+    let color = NSColor::tertiaryLabelColor();
+    for s in labels {
+        let lbl = NSTextField::labelWithString(&NSString::from_str(s), mtm);
+        lbl.setFont(Some(&font));
+        lbl.setTextColor(Some(&color));
+        lbl.setAlignment(NSTextAlignment::Center);
+        row.addArrangedSubview(&lbl);
+    }
+    row
 }
 
 fn create_add_button_row(mtm: MainThreadMarker, target: &PrefsController) -> Retained<NSStackView> {

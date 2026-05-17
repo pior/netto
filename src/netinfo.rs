@@ -68,9 +68,9 @@ fn default_gateway_v6() -> Option<String> {
     for line in stdout.lines() {
         if let Some(rest) = line.trim().strip_prefix("gateway:") {
             let addr = rest.trim();
-            // IPv6 gateways often carry a zone id ("fe80::1%en0"); drop it
-            // for display, the route is established via the default interface.
-            let addr = addr.split('%').next().unwrap_or(addr);
+            // Keep the zone id ("fe80::1%en0") intact — ICMPv6 to a
+            // link-local address needs the scope_id to know which
+            // interface to send on. Display code strips it for rendering.
             if !addr.is_empty() {
                 return Some(addr.to_string());
             }
@@ -80,15 +80,27 @@ fn default_gateway_v6() -> Option<String> {
 }
 
 fn local_v4_for(interface: &str) -> Option<String> {
-    let output = Command::new("ipconfig")
-        .args(["getifaddr", interface])
-        .output()
-        .ok()?;
+    // Parse `ifconfig <iface>` for the first inet line. We used to shell out
+    // to `ipconfig getifaddr`, but that only returns DHCP-assigned addresses
+    // — on IPv6-only mobile networks (e.g. Orange France) the IPv4 address
+    // is the CLAT-synthesized 192.0.0.2/32, configured locally by macOS, and
+    // ipconfig returns empty for it.
+    let output = Command::new("ifconfig").arg(interface).output().ok()?;
     if !output.status.success() {
         return None;
     }
-    let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if ip.is_empty() { None } else { Some(ip) }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("inet ") else {
+            continue;
+        };
+        let addr = rest.split_whitespace().next()?;
+        if !addr.is_empty() {
+            return Some(addr.to_string());
+        }
+    }
+    None
 }
 
 fn local_v6_for(interface: &str) -> Option<String> {
