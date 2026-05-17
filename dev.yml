@@ -25,11 +25,13 @@ commands:
     desc: Build the .app bundle
     run: |
       cargo build --release
+      scripts/generate-icons.sh
       rm -rf target/Netto.app
       mkdir -p target/Netto.app/Contents/MacOS
       mkdir -p target/Netto.app/Contents/Resources
       cp Info.plist target/Netto.app/Contents/
       cp target/release/netto target/Netto.app/Contents/MacOS/
+      cp target/AppIcon.icns target/Netto.app/Contents/Resources/
       echo "Built target/Netto.app"
 
   install:
